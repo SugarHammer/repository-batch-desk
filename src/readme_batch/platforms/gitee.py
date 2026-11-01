@@ -43,6 +43,8 @@ class GiteeClient:
                         full_name=item["full_name"],
                         default_branch=item["default_branch"],
                         html_url=item["html_url"],
+                        display_name=item["name"],
+                        private=item["private"],
                     )
                     for item in items
                 )
@@ -51,6 +53,25 @@ class GiteeClient:
             if len(items) < 100:
                 return repositories
             page += 1
+
+    def update_repository_settings(
+        self,
+        repository: Repository,
+        display_name: str,
+        private: bool | None,
+    ) -> None:
+        data = {"access_token": self._token, "name": display_name}
+        if private is not None:
+            data["private"] = private
+        self._request("PATCH", f"/repos/{repository.owner}/{repository.name}", data=data)
+
+    def add_project_labels(self, repository: Repository, labels: tuple[str, ...]) -> None:
+        self._request(
+            "POST",
+            f"/repos/{repository.owner}/{repository.name}/project_labels",
+            params={"access_token": self._token},
+            json=list(labels),
+        )
 
     def read_readme(self, repository: Repository) -> FileSnapshot:
         response = self._request(

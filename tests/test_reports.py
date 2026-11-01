@@ -3,6 +3,13 @@ from datetime import datetime, timezone
 
 from readme_batch.batches import Batch, BatchItem, BatchState, CommitState, PreviewState
 from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.operations import (
+    Operation,
+    OperationItem,
+    OperationItemState,
+    OperationKind,
+    OperationState,
+)
 from readme_batch.reports import JsonReportStore
 
 
@@ -64,3 +71,40 @@ def test_report_contains_results_but_no_sensitive_content(tmp_path):
     assert "secret-old" not in serialized
     assert "secret-new" not in serialized
     assert "diff" not in payload["items"][0]
+
+
+def test_operation_report_contains_public_results_without_parameter_snapshot(tmp_path):
+    repo = Repository("owner", "repo", "owner/repo", "main", "https://gitee.com/owner/repo")
+    operation = Operation(
+        id="operation-123",
+        kind=OperationKind.SETTINGS,
+        revision=0,
+        state=OperationState.COMPLETE,
+        created_at=datetime(2026, 11, 1, tzinfo=timezone.utc),
+        items=(
+            OperationItem(
+                repository=repo,
+                state=OperationItemState.FAILED,
+                error="Gitee request failed (500)",
+                retryable=True,
+            ),
+        ),
+    )
+
+    path = JsonReportStore(tmp_path).save_operation(operation)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["id"] == "operation-123"
+    assert payload["kind"] == "settings"
+    assert payload["state"] == "complete"
+    assert payload["items"][0] == {
+        "full_name": "owner/repo",
+        "default_branch": "main",
+        "state": "failed",
+        "error": "Gitee request failed (500)",
+        "retryable": True,
+    }
+    serialized = path.read_text(encoding="utf-8")
+    assert "access_token" not in serialized
+    assert "names" not in payload
+    assert "labels" not in payload

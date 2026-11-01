@@ -1,4 +1,5 @@
 import base64
+import json
 from urllib.parse import parse_qs
 
 import httpx
@@ -20,6 +21,7 @@ def repo_payload(number: int) -> dict:
         "name": f"repo-{number}",
         "full_name": f"owner/repo-{number}",
         "default_branch": "main",
+        "private": False,
         "html_url": f"https://gitee.com/owner/repo-{number}",
         "owner": {
             "id": 1,
@@ -206,3 +208,55 @@ def test_network_errors_are_temporary_and_redacted():
 
     assert caught.value.kind is ErrorKind.TEMPORARY
     assert TOKEN not in str(caught.value)
+
+
+@respx.mock
+def test_list_repositories_reads_display_name_and_private():
+    payload = repo_payload(1)
+    payload["name"] = "显示名称"
+    payload["private"] = True
+    respx.get(f"{API}/user/repos").mock(return_value=httpx.Response(200, json=[payload]))
+
+    repos = GiteeClient(TOKEN).list_repositories()
+
+    assert repos[0].name == "repo-1"
+    assert repos[0].display_name == "显示名称"
+    assert repos[0].private is True
+
+
+@respx.mock
+def test_update_repository_settings_sends_name_and_private_without_path():
+    route = respx.patch(f"{API}/repos/owner/repo-1").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    GiteeClient(TOKEN).update_repository_settings(repository(), "新名称", False)
+
+    form = parse_qs(route.calls[0].request.content.decode("utf-8"))
+    assert form["name"] == ["新名称"]
+    assert form["private"] == ["false"]
+    assert "path" not in form
+
+
+@respx.mock
+def test_visibility_only_update_sends_current_display_name():
+    route = respx.patch(f"{API}/repos/owner/repo-1").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    GiteeClient(TOKEN).update_repository_settings(repository(), "显示名称", True)
+
+    form = parse_qs(route.calls[0].request.content.decode("utf-8"))
+    assert form["name"] == ["显示名称"]
+    assert form["private"] == ["true"]
+
+
+@respx.mock
+def test_add_project_labels_posts_json_array():
+    route = respx.post(f"{API}/repos/owner/repo-1/project_labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    GiteeClient(TOKEN).add_project_labels(repository(), ("Java", "Spring Boot"))
+
+    assert json.loads(route.calls[0].request.content) == ["Java", "Spring Boot"]

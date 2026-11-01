@@ -8,6 +8,8 @@ class Repository:
     full_name: str
     default_branch: str
     html_url: str
+    display_name: str = ""
+    private: bool = False
 
 
 @dataclass(frozen=True)

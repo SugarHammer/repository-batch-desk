@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from readme_batch.app import create_app
 from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.platforms.base import ErrorKind, PlatformError
 
 TOKEN = "test-api-token"
 
@@ -12,10 +13,20 @@ TOKEN = "test-api-token"
 class FakeAdapter:
     def __init__(self):
         self.repos = [
-            Repository("owner", "repo-1", "owner/repo-1", "main", "https://example/1"),
-            Repository("owner", "repo-2", "owner/repo-2", "main", "https://example/2"),
+            Repository(
+                "owner", "repo-1", "owner/repo-1", "main", "https://example/1",
+                display_name="Repo One", private=True,
+            ),
+            Repository(
+                "owner", "repo-2", "owner/repo-2", "main", "https://example/2",
+                display_name="Repo Two", private=False,
+            ),
         ]
         self.updates = []
+        self.settings_calls = []
+        self.label_calls = []
+        self.settings_errors = {}
+        self.label_errors = {}
 
     def list_repositories(self):
         return self.repos
@@ -27,6 +38,18 @@ class FakeAdapter:
     def update_readme(self, repository, snapshot, new_content, message):
         self.updates.append((repository.full_name, snapshot.sha, new_content, message))
         return CommitInfo("commit-1", "https://example/commit/1")
+
+    def update_repository_settings(self, repository, display_name, private):
+        self.settings_calls.append((repository.full_name, display_name, private))
+        errors = self.settings_errors.get(repository.full_name, [])
+        if errors:
+            raise errors.pop(0)
+
+    def add_project_labels(self, repository, labels):
+        self.label_calls.append((repository.full_name, labels))
+        errors = self.label_errors.get(repository.full_name, [])
+        if errors:
+            raise errors.pop(0)
 
 
 class FakeCredentials:
@@ -238,3 +261,160 @@ def test_saved_session_reports_active(tmp_path):
 
     assert response.status_code == 200
     assert response.json() == {"active": True}
+
+
+def wait_for_operation(client, operation_id):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        payload = client.get(f"/api/operations/{operation_id}").json()
+        if payload["state"] == "complete":
+            return payload
+        time.sleep(0.01)
+    raise AssertionError(f"operation did not complete: {payload}")
+
+
+def test_repository_list_includes_display_name_and_private(services):
+    _, _, client = services
+    start_session(client)
+
+    payload = client.get("/api/repositories").json()
+
+    assert payload[0]["display_name"] == "Repo One"
+    assert payload[0]["private"] is True
+    assert payload[1]["display_name"] == "Repo Two"
+    assert payload[1]["private"] is False
+
+
+def test_settings_operation_skips_unchanged_items_and_maps_visibility(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/settings",
+        json={
+            "selected": ["owner/repo-1", "owner/repo-2"],
+            "names": {"owner/repo-1": "  新名称  "},
+            "visibility": "public",
+        },
+    )
+
+    assert response.status_code == 202
+    operation = wait_for_operation(client, response.json()["id"])
+    assert len(operation["items"]) == 1
+    assert operation["items"][0]["repository"]["full_name"] == "owner/repo-1"
+    assert adapter.settings_calls == [("owner/repo-1", "新名称", False)]
+
+    response = client.post(
+        "/api/operations/settings",
+        json={"selected": ["owner/repo-2"], "names": {}, "visibility": "private"},
+    )
+    wait_for_operation(client, response.json()["id"])
+    assert adapter.settings_calls[-1] == ("owner/repo-2", "Repo Two", True)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"selected": ["owner/repo-1"], "names": {"owner/repo-1": "  "}, "visibility": "keep"},
+        {"selected": [], "names": {}, "visibility": "private"},
+        {"selected": ["owner/unknown"], "names": {}, "visibility": "private"},
+        {"selected": ["owner/repo-1"], "names": {"owner/unknown": "Name"}, "visibility": "keep"},
+        {"selected": ["owner/repo-1"], "names": {"owner/repo-1": "Repo One"}, "visibility": "keep"},
+    ],
+)
+def test_invalid_settings_requests_do_not_write(services, payload):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post("/api/operations/settings", json=payload)
+
+    assert 400 <= response.status_code < 500
+    assert adapter.settings_calls == []
+
+
+def test_labels_operation_trims_and_stably_deduplicates(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/labels",
+        json={
+            "selected": ["owner/repo-1", "owner/repo-2"],
+            "labels": [" Java ", "Spring Boot", "Java", "", "Spring Boot"],
+        },
+    )
+
+    assert response.status_code == 202
+    operation = wait_for_operation(client, response.json()["id"])
+    assert all(item["state"] == "success" for item in operation["items"])
+    assert adapter.label_calls == [
+        ("owner/repo-1", ("Java", "Spring Boot")),
+        ("owner/repo-2", ("Java", "Spring Boot")),
+    ]
+    assert TOKEN not in str(operation)
+
+
+@pytest.mark.parametrize("labels", [[], [" ", ""]])
+def test_empty_labels_are_rejected(services, labels):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/labels", json={"selected": ["owner/repo-1"], "labels": labels}
+    )
+
+    assert 400 <= response.status_code < 500
+    assert adapter.label_calls == []
+
+
+def test_unknown_operation_and_invalid_retry_are_safe(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+    adapter.label_errors["owner/repo-1"] = [PlatformError(ErrorKind.PERMISSION, "denied")]
+    operation_id = client.post(
+        "/api/operations/labels",
+        json={"selected": ["owner/repo-1"], "labels": ["Java"]},
+    ).json()["id"]
+    wait_for_operation(client, operation_id)
+
+    assert client.get("/api/operations/missing").status_code == 404
+    response = client.post(
+        f"/api/operations/{operation_id}/retry", json={"full_name": "owner/repo-1"}
+    )
+    assert response.status_code == 409
+
+
+def test_replacing_and_deleting_session_hides_old_operations(services):
+    _, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+    operation_id = client.post(
+        "/api/operations/labels",
+        json={"selected": ["owner/repo-1"], "labels": ["Java"]},
+    ).json()["id"]
+    wait_for_operation(client, operation_id)
+
+    start_session(client)
+    assert client.get(f"/api/operations/{operation_id}").status_code == 404
+    client.delete("/api/session")
+    assert client.get(f"/api/operations/{operation_id}").status_code == 401
+
+
+def test_operation_mutations_require_process_token(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/labels",
+        json={"selected": ["owner/repo-1"], "labels": ["Java"]},
+        headers={"X-README-Batch-Token": ""},
+    )
+
+    assert response.status_code == 403
+    assert adapter.label_calls == []

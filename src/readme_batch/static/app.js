@@ -28,7 +28,9 @@ async function api(path, options = {}) {
         message = payload.detail.map((issue) => issue.msg || "请求参数无效").join("；");
       } else if (payload.detail) message = "请求参数无效";
     } catch (_) {}
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204 || response.headers.get("content-length") === "0") return null;
   return response.json();
@@ -52,6 +54,7 @@ function renderRepositories() {
       if (checkbox.checked) selected.add(repository.full_name);
       else selected.delete(repository.full_name);
       draftChanged();
+      document.dispatchEvent(new Event("repository-selection-changed"));
     });
     const text = document.createElement("span");
     const name = document.createElement("span");
@@ -105,11 +108,18 @@ function draftChanged() {
   }, 150);
 }
 
-async function loadRepositories() {
+async function loadRepositories(preserveSelection = false) {
+  const previousSelection = new Set(selected);
   repositories = await api("/api/repositories");
   selected.clear();
+  if (preserveSelection) {
+    repositories.forEach((repository) => {
+      if (previousSelection.has(repository.full_name)) selected.add(repository.full_name);
+    });
+  }
   invalidatePreview();
   renderRepositories();
+  document.dispatchEvent(new Event("repositories-loaded"));
 }
 
 async function connect() {

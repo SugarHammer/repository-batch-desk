@@ -12,16 +12,24 @@ from fastapi.staticfiles import StaticFiles
 from readme_batch.batches import Batch, BatchManager, StalePreviewError
 from readme_batch.credentials import CredentialStore
 from readme_batch.models import Repository
+from readme_batch.operations import Operation, OperationManager, StaleOperationError
 from readme_batch.platforms.base import ErrorKind, PlatformError, RepositoryPlatform
 from readme_batch.platforms.gitee import GiteeClient
 from readme_batch.reports import JsonReportStore
-from readme_batch.schemas import DraftRequest, RetryRequest, SessionRequest
+from readme_batch.schemas import (
+    DraftRequest,
+    LabelsOperationRequest,
+    RetryRequest,
+    SessionRequest,
+    SettingsOperationRequest,
+)
 
 
 @dataclass
 class AppState:
     adapter: RepositoryPlatform | None = None
     manager: BatchManager | None = None
+    operations: OperationManager | None = None
     repositories: dict[str, Repository] = field(default_factory=dict)
     draft: DraftRequest = field(default_factory=DraftRequest)
 
@@ -72,6 +80,7 @@ def create_app(
         state.adapter = adapter
         state.repositories = {}
         state.manager = BatchManager(adapter, max_workers=3, on_complete=reports.save)
+        state.operations = OperationManager(adapter, max_workers=3, on_complete=reports.save_operation)
         if remember:
             credentials.save(token)
         else:
@@ -99,6 +108,8 @@ def create_app(
             raise HTTPException(422, "token must not be empty")
         if state.manager:
             state.manager.invalidate()
+        if state.operations:
+            state.operations.invalidate()
         activate(request.token, request.remember)
         return Response(status_code=204)
 
@@ -106,14 +117,17 @@ def create_app(
     def delete_session() -> Response:
         if state.manager:
             state.manager.invalidate()
+        if state.operations:
+            state.operations.invalidate()
         state.adapter = None
         state.manager = None
+        state.operations = None
         state.repositories = {}
         credentials.clear()
         return Response(status_code=204)
 
     @app.get("/api/repositories")
-    def repositories() -> list[dict[str, str]]:
+    def repositories() -> list[dict[str, object]]:
         adapter = _require_adapter(state)
         try:
             items = adapter.list_repositories()
@@ -181,6 +195,59 @@ def create_app(
             raise HTTPException(409, str(error)) from None
         return Response(status_code=202)
 
+    @app.post("/api/operations/settings", status_code=202)
+    def create_settings_operation(request: SettingsOperationRequest) -> dict[str, str]:
+        operations = _require_operations(state)
+        selected = _selected_repositories(state, request.selected)
+        selected_names = {repo.full_name for repo in selected}
+        if any(full_name not in selected_names for full_name in request.names):
+            raise HTTPException(400, "name change repository is not selected")
+        names = {}
+        changes = []
+        for repo in selected:
+            current_name = repo.display_name or repo.name
+            display_name = request.names.get(repo.full_name, current_name).strip()
+            if not display_name:
+                raise HTTPException(400, "repository display name must not be empty")
+            private = None if request.visibility == "keep" else request.visibility == "private"
+            if display_name == current_name and (private is None or private == repo.private):
+                continue
+            names[repo.full_name] = display_name
+            changes.append(repo)
+        if not changes:
+            raise HTTPException(400, "no repository settings changed")
+        operation_id = operations.start_settings(changes, names, request.visibility)
+        return {"id": operation_id}
+
+    @app.post("/api/operations/labels", status_code=202)
+    def create_labels_operation(request: LabelsOperationRequest) -> dict[str, str]:
+        operations = _require_operations(state)
+        selected = _selected_repositories(state, request.selected)
+        labels = list(dict.fromkeys(label.strip() for label in request.labels if label.strip()))
+        if not labels:
+            raise HTTPException(400, "at least one label must be supplied")
+        operation_id = operations.start_labels(selected, labels)
+        return {"id": operation_id}
+
+    @app.get("/api/operations/{operation_id}")
+    def get_operation(operation_id: str) -> dict:
+        operations = _require_operations(state)
+        try:
+            return _operation_dict(operations.get_operation(operation_id))
+        except KeyError:
+            raise HTTPException(404, "operation not found") from None
+
+    @app.post("/api/operations/{operation_id}/retry", status_code=202)
+    def retry_operation(operation_id: str, request: RetryRequest) -> Response:
+        operations = _require_operations(state)
+        try:
+            operations.start_retry(operation_id, request.full_name)
+        except KeyError:
+            raise HTTPException(404, "operation not found") from None
+        except StaleOperationError as error:
+            raise HTTPException(409, str(error)) from None
+        return Response(status_code=202)
+
     static_directory = Path(__file__).resolve().parent / "static"
     app.mount("/", StaticFiles(directory=static_directory, html=True), name="static")
     return app
@@ -198,6 +265,21 @@ def _require_manager(state: AppState) -> BatchManager:
     return state.manager
 
 
+def _require_operations(state: AppState) -> OperationManager:
+    if state.operations is None:
+        raise HTTPException(401, "Gitee session required")
+    return state.operations
+
+
+def _selected_repositories(state: AppState, selected: list[str]) -> list[Repository]:
+    if not selected:
+        raise HTTPException(400, "at least one repository must be selected")
+    try:
+        return [state.repositories[name] for name in dict.fromkeys(selected)]
+    except KeyError:
+        raise HTTPException(400, "selected repository is not loaded") from None
+
+
 def _platform_http_error(error: PlatformError) -> HTTPException:
     status = {
         ErrorKind.AUTH: 401,
@@ -211,13 +293,33 @@ def _platform_http_error(error: PlatformError) -> HTTPException:
     return HTTPException(status, str(error))
 
 
-def _repository_dict(repository: Repository) -> dict[str, str]:
+def _repository_dict(repository: Repository) -> dict[str, object]:
     return {
         "owner": repository.owner,
         "name": repository.name,
         "full_name": repository.full_name,
         "default_branch": repository.default_branch,
         "html_url": repository.html_url,
+        "display_name": repository.display_name,
+        "private": repository.private,
+    }
+
+
+def _operation_dict(operation: Operation) -> dict:
+    return {
+        "id": operation.id,
+        "kind": operation.kind.value,
+        "state": operation.state.value,
+        "created_at": operation.created_at.isoformat(),
+        "items": [
+            {
+                "repository": _repository_dict(item.repository),
+                "state": item.state.value,
+                "error": item.error,
+                "retryable": item.retryable,
+            }
+            for item in operation.items
+        ],
     }
 
 

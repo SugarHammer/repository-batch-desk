@@ -33,3 +33,16 @@ class RepositoryPlatform(Protocol):
         new_content: str,
         message: str,
     ) -> CommitInfo: ...
+
+    def update_repository_settings(
+        self,
+        repository: Repository,
+        display_name: str,
+        private: bool | None,
+    ) -> None: ...
+
+    def add_project_labels(
+        self,
+        repository: Repository,
+        labels: tuple[str, ...],
+    ) -> None: ...
