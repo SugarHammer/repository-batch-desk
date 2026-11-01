@@ -1,0 +1,13 @@
+.worktrees/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+htmlcov/
+.coverage
+playwright-report/
+test-results/
+build/
+dist/
+*.spec
+.superpowers/
