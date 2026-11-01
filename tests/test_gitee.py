@@ -107,6 +107,41 @@ def test_update_readme_sends_preview_sha_and_encoded_content():
     assert base64.b64decode(form["content"][0]).decode("utf-8") == "中文\r\nnew"
 
 
+@respx.mock
+def test_update_accepts_api_commit_url_and_builds_web_link():
+    snapshot = FileSnapshot("README.md", "main", "old\n", "blob-1")
+    respx.put(f"{API}/repos/owner/repo-1/contents/README.md").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "content": {"path": "README.md", "sha": "blob-2"},
+                "commit": {
+                    "sha": "commit-1",
+                    "url": f"{API}/repos/owner/repo-1/commits/commit-1",
+                },
+            },
+        )
+    )
+
+    result = GiteeClient(TOKEN).update_readme(repository(), snapshot, "new", "docs: update")
+
+    assert result.sha == "commit-1"
+    assert result.url == "https://gitee.com/owner/repo-1/commit/commit-1"
+
+
+@respx.mock
+def test_update_http_400_is_a_sha_conflict():
+    snapshot = FileSnapshot("README.md", "main", "old", "stale-sha")
+    respx.put(f"{API}/repos/owner/repo-1/contents/README.md").mock(
+        return_value=httpx.Response(400, json={"message": "invalid sha"})
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).update_readme(repository(), snapshot, "new", "docs: update")
+
+    assert caught.value.kind is ErrorKind.CONFLICT
+
+
 @pytest.mark.parametrize(
     ("status", "kind"),
     [

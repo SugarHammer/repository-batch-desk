@@ -206,3 +206,13 @@ def test_filter_preserves_selection_and_edits_invalidate_preview(page, site):
     preview(page)
     select_repo(page, "owner/repo-2")
     expect(page.locator("#commit")).to_be_disabled()
+
+
+def test_validation_errors_are_readable_instead_of_object(page, site):
+    _, base_url = site
+    page.goto(base_url)
+
+    page.locator("#connect").click()
+
+    expect(page.locator("#connection-status")).not_to_have_text("[object Object]")
+    expect(page.locator("#connection-status")).not_to_be_empty()

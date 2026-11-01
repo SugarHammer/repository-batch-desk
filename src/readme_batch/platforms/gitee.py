@@ -87,14 +87,22 @@ class GiteeClient:
                 "message": message,
                 "branch": snapshot.branch,
             },
+            bad_request_kind=ErrorKind.CONFLICT,
         )
         try:
             commit = response.json()["commit"]
-            return CommitInfo(sha=commit["sha"], url=commit["html_url"])
+            url = commit.get("html_url") or f"{repository.html_url}/commit/{commit['sha']}"
+            return CommitInfo(sha=commit["sha"], url=url)
         except (KeyError, TypeError, ValueError):
             raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
 
-    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        bad_request_kind: ErrorKind = ErrorKind.REQUEST,
+        **kwargs,
+    ) -> httpx.Response:
         try:
             response = self._client.request(method, path, **kwargs)
         except httpx.HTTPError:
@@ -102,6 +110,7 @@ class GiteeClient:
         if response.is_success:
             return response
         kind = {
+            400: bad_request_kind,
             401: ErrorKind.AUTH,
             403: ErrorKind.PERMISSION,
             404: ErrorKind.NOT_FOUND,

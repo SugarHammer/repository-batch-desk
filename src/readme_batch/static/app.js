@@ -15,7 +15,10 @@ async function api(path, options = {}) {
     let message = `请求失败 (${response.status})`;
     try {
       const payload = await response.json();
-      if (payload.detail) message = payload.detail;
+      if (typeof payload.detail === "string") message = payload.detail;
+      else if (Array.isArray(payload.detail)) {
+        message = payload.detail.map((issue) => issue.msg || "请求参数无效").join("；");
+      } else if (payload.detail) message = "请求参数无效";
     } catch (_) {}
     throw new Error(message);
   }
