@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Callable
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.staticfiles import StaticFiles
 
 from readme_batch.batches import Batch, BatchManager, StalePreviewError
 from readme_batch.credentials import CredentialStore
@@ -137,6 +138,8 @@ def create_app(
             raise HTTPException(409, str(error)) from None
         return Response(status_code=202)
 
+    static_directory = Path(__file__).resolve().parent / "static"
+    app.mount("/", StaticFiles(directory=static_directory, html=True), name="static")
     return app
 
 

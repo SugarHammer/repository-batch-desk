@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'none'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>README 批量发布台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">LOCAL RELEASE DESK · 01</p>
+      <h1>README 批量发布台</h1>
+      <p class="subtitle">先审阅每一处变化，再一次提交。</p>
+    </div>
+    <div class="local-seal"><span></span> 仅本机运行</div>
+  </header>
+
+  <main class="workspace">
+    <aside class="sidebar" aria-label="连接与仓库">
+      <section class="panel connection-panel">
+        <div class="section-heading"><span>01</span><h2>连接 Gitee</h2></div>
+        <label for="token">私人访问令牌</label>
+        <input id="token" type="password" autocomplete="off" placeholder="仅发送至 Gitee 官方接口">
+        <label class="check-label"><input id="remember" type="checkbox"> 记住令牌</label>
+        <button id="connect" class="button dark" type="button">连接并加载仓库</button>
+        <p id="connection-status" class="status" role="status">尚未连接</p>
+      </section>
+
+      <section class="panel repositories-panel">
+        <div class="section-heading"><span>02</span><h2>选择仓库</h2></div>
+        <label for="repository-filter">筛选仓库</label>
+        <input id="repository-filter" type="search" placeholder="按名称筛选">
+        <div id="repository-list" class="repository-list" aria-live="polite">
+          <p class="empty">连接后，仓库将出现在这里。</p>
+        </div>
+      </section>
+    </aside>
+
+    <div class="content">
+      <section class="panel rules-panel">
+        <div class="section-heading"><span>03</span><h2>定义替换</h2></div>
+        <div class="editor-grid">
+          <div>
+            <label for="old-text">旧内容</label>
+            <textarea id="old-text" rows="7" placeholder="精确匹配，区分大小写"></textarea>
+          </div>
+          <div>
+            <label for="new-text">新内容</label>
+            <textarea id="new-text" rows="7" placeholder="留空表示删除旧内容"></textarea>
+          </div>
+        </div>
+        <label for="commit-message">统一提交说明</label>
+        <input id="commit-message" type="text" value="docs: 批量更新 README">
+        <div class="action-row">
+          <p class="hint">预览只读取文件，不会修改远端仓库。</p>
+          <button id="preview" class="button accent" type="button">生成差异预览</button>
+        </div>
+      </section>
+
+      <section class="panel preview-panel">
+        <div class="section-heading"><span>04</span><h2>审阅并提交</h2></div>
+        <div class="review-bar">
+          <p id="preview-summary" class="summary">等待生成预览</p>
+          <button id="commit" class="button accent" type="button" disabled>确认提交</button>
+        </div>
+        <div id="preview-items" class="preview-items" aria-live="polite"></div>
+      </section>
+    </div>
+  </main>
+
+  <footer>README BATCH EDITOR <span>·</span> 所有请求仅在本机与 Gitee 之间传递</footer>
+  <script src="/app.js"></script>
+</body>
+</html>
