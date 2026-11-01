@@ -49,14 +49,17 @@ class BrowserAdapter:
 
 
 class BrowserCredentials:
+    def __init__(self):
+        self.saved = TOKEN
+
     def load(self):
-        return None
+        return self.saved
 
     def save(self, token):
-        pass
+        self.saved = token
 
     def clear(self):
-        pass
+        self.saved = None
 
 
 @pytest.fixture
@@ -216,3 +219,12 @@ def test_validation_errors_are_readable_instead_of_object(page, site):
 
     expect(page.locator("#connection-status")).not_to_have_text("[object Object]")
     expect(page.locator("#connection-status")).not_to_be_empty()
+
+
+def test_saved_session_loads_repositories_when_page_opens(page, site):
+    _, base_url = site
+
+    page.goto(base_url)
+
+    expect(page.locator(".repository-row")).to_have_count(4)
+    expect(page.locator("#connection-status")).to_contain_text("已恢复保存的会话")

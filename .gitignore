@@ -10,5 +10,4 @@ playwright-report/
 test-results/
 build/
 dist/
-*.spec
 .superpowers/

@@ -5,11 +5,19 @@ let batchId = null;
 let batch = null;
 let draftTimer = null;
 let pollTimer = null;
+let apiToken = "";
+const tokenReady = fetch("/api/ui-token")
+  .then((response) => response.json())
+  .then((payload) => { apiToken = payload.token; });
 
 async function api(path, options = {}) {
+  await tokenReady;
   const response = await fetch(path, {
     ...options,
-    headers: options.body ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      "X-README-Batch-Token": apiToken,
+    },
   });
   if (!response.ok) {
     let message = `请求失败 (${response.status})`;
@@ -97,6 +105,13 @@ function draftChanged() {
   }, 150);
 }
 
+async function loadRepositories() {
+  repositories = await api("/api/repositories");
+  selected.clear();
+  invalidatePreview();
+  renderRepositories();
+}
+
 async function connect() {
   byId("connect").disabled = true;
   setConnectionStatus("正在连接并读取仓库…");
@@ -106,10 +121,7 @@ async function connect() {
       body: JSON.stringify({ token: byId("token").value, remember: byId("remember").checked }),
     });
     byId("token").value = "";
-    repositories = await api("/api/repositories");
-    selected.clear();
-    invalidatePreview();
-    renderRepositories();
+    await loadRepositories();
     setConnectionStatus(`已加载 ${repositories.length} 个仓库`);
   } catch (error) {
     setConnectionStatus(error.message);
@@ -249,3 +261,13 @@ byId("repository-filter").addEventListener("input", filterRepositories);
 ["old-text", "new-text", "commit-message"].forEach((id) => {
   byId(id).addEventListener("input", draftChanged);
 });
+
+async function initializeSession() {
+  const session = await api("/api/session");
+  if (session.active) {
+    await loadRepositories();
+    setConnectionStatus(`已恢复保存的会话，共 ${repositories.length} 个仓库`);
+  }
+}
+
+initializeSession().catch((error) => setConnectionStatus(error.message));

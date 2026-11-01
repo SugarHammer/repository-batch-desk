@@ -1,9 +1,12 @@
 import os
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from readme_batch.batches import Batch, BatchManager, StalePreviewError
@@ -33,6 +36,36 @@ def create_app(
     reports = JsonReportStore(report_directory or _default_report_directory())
     state = AppState()
     app.state.editor = state
+    app.state.api_token = secrets.token_urlsafe(32)
+    allowed_hosts = {"127.0.0.1", "localhost", "::1", "testserver"}
+
+    @app.middleware("http")
+    async def protect_local_api(request: Request, call_next):
+        if not request.url.path.startswith("/api"):
+            return await call_next(request)
+        if request.url.hostname not in allowed_hosts:
+            return JSONResponse({"detail": "invalid local host"}, status_code=403)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            fetch_site = request.headers.get("sec-fetch-site")
+            if fetch_site and fetch_site != "same-origin":
+                return JSONResponse({"detail": "cross-site request rejected"}, status_code=403)
+            origin = request.headers.get("origin")
+            if origin:
+                parsed = urlparse(origin)
+                if (
+                    parsed.scheme != "http"
+                    or parsed.hostname != request.url.hostname
+                    or parsed.port != request.url.port
+                ):
+                    return JSONResponse({"detail": "invalid request origin"}, status_code=403)
+        public_paths = {"/api/health", "/api/ui-token"}
+        supplied_token = request.headers.get("x-readme-batch-token", "")
+        if (
+            request.url.path not in public_paths
+            and not secrets.compare_digest(supplied_token, app.state.api_token)
+        ):
+            return JSONResponse({"detail": "invalid local API token"}, status_code=403)
+        return await call_next(request)
 
     def activate(token: str, remember: bool = False) -> None:
         adapter = client_factory(token)
@@ -41,10 +74,20 @@ def create_app(
         state.manager = BatchManager(adapter, max_workers=3, on_complete=reports.save)
         if remember:
             credentials.save(token)
+        else:
+            credentials.clear()
 
     saved_token = credentials.load()
     if saved_token:
-        activate(saved_token)
+        activate(saved_token, remember=True)
+
+    @app.get("/api/ui-token")
+    def ui_token() -> dict[str, str]:
+        return {"token": app.state.api_token}
+
+    @app.get("/api/session")
+    def session_status() -> dict[str, bool]:
+        return {"active": state.adapter is not None}
 
     @app.get("/api/health")
     def health() -> dict[str, str]:
@@ -191,6 +234,7 @@ def _batch_dict(batch: Batch) -> dict:
                 "match_count": item.match_count,
                 "diff": item.diff,
                 "error": item.error,
+                "reconciled": item.reconciled,
                 "commit_state": item.commit_state.value if item.commit_state else None,
                 "commit_info": (
                     {"sha": item.commit_info.sha, "url": item.commit_info.url}

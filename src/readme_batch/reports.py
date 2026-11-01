@@ -27,6 +27,7 @@ class JsonReportStore:
                     "match_count": item.match_count,
                     "commit_sha": item.commit_info.sha if item.commit_info else None,
                     "commit_url": item.commit_info.url if item.commit_info else None,
+                    "reconciled": item.reconciled,
                     "error": item.error,
                 }
                 for item in batch.items

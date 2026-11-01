@@ -157,7 +157,7 @@ def test_conflict_requires_new_preview_instead_of_automatic_retry():
     assert len(adapter.updates) == 1
     with pytest.raises(StalePreviewError):
         manager.start_retry(batch_id, "owner/repo-1")
-    assert adapter.reads == ["owner/repo-1"]
+    assert adapter.reads == ["owner/repo-1", "owner/repo-1"]
     assert len(adapter.updates) == 1
 
 
@@ -232,3 +232,82 @@ def test_concurrency_is_limited_and_one_failure_does_not_cancel_others():
     assert len(batch.items) == 7
     assert batch.items[3].preview_state is PreviewState.READ_FAILED
     assert sum(item.preview_state is PreviewState.READY for item in batch.items) == 6
+
+
+def test_read_retry_does_not_resubmit_successful_items():
+    adapter = FakeAdapter(
+        {
+            "owner/repo-1": PlatformError(ErrorKind.TEMPORARY, "temporary"),
+            "owner/repo-2": "old",
+        }
+    )
+    manager = BatchManager(adapter, max_attempts=1)
+    batch_id = manager.start_preview([repository(1), repository(2)], "old", "new", "docs")
+    wait_for(manager, batch_id, {BatchState.READY})
+    manager.start_commit(batch_id)
+    wait_for(manager, batch_id, {BatchState.COMPLETE})
+    adapter.contents["owner/repo-1"] = "old"
+
+    manager.start_retry(batch_id, "owner/repo-1")
+    wait_for(manager, batch_id, {BatchState.READY})
+    manager.start_commit(batch_id)
+    batch = wait_for(manager, batch_id, {BatchState.COMPLETE})
+
+    assert batch.items[0].commit_state is CommitState.SUCCESS
+    assert batch.items[1].commit_state is CommitState.SUCCESS
+    assert sum(update[0] == "owner/repo-1" for update in adapter.updates) == 1
+    assert sum(update[0] == "owner/repo-2" for update in adapter.updates) == 1
+
+
+def test_retry_is_rejected_while_commit_is_running():
+    adapter = FakeAdapter(
+        {
+            "owner/repo-1": PlatformError(ErrorKind.TEMPORARY, "temporary"),
+            "owner/repo-2": "old",
+        }
+    )
+    manager = BatchManager(adapter, max_attempts=1)
+    batch_id = manager.start_preview([repository(1), repository(2)], "old", "new", "docs")
+    wait_for(manager, batch_id, {BatchState.READY})
+    manager.start_commit(batch_id)
+
+    with pytest.raises(StalePreviewError, match="still running"):
+        manager.start_retry(batch_id, "owner/repo-1")
+
+
+class LostResponseAdapter(FakeAdapter):
+    def update_readme(self, repo, snapshot, new_content, message):
+        self.updates.append((repo.full_name, snapshot.sha, new_content, message))
+        self.contents[repo.full_name] = new_content
+        raise PlatformError(ErrorKind.TEMPORARY, "response lost")
+
+
+def test_lost_successful_response_is_reconciled_without_second_update():
+    adapter = LostResponseAdapter({"owner/repo-1": "old"})
+    manager = BatchManager(adapter, max_attempts=3, sleeper=lambda _: None)
+    batch_id = manager.start_preview([repository(1)], "old", "new", "docs")
+    wait_for(manager, batch_id, {BatchState.READY})
+
+    manager.start_commit(batch_id)
+    batch = wait_for(manager, batch_id, {BatchState.COMPLETE})
+
+    assert batch.items[0].commit_state is CommitState.SUCCESS
+    assert batch.items[0].reconciled is True
+    assert len(adapter.updates) == 1
+    assert adapter.contents["owner/repo-1"] == "new"
+
+
+def test_auth_failure_stops_queued_reads():
+    adapter = FakeAdapter(
+        {
+            f"owner/repo-{n}": PlatformError(ErrorKind.AUTH, "unauthorized")
+            for n in range(1, 7)
+        }
+    )
+    manager = BatchManager(adapter, max_workers=1, max_attempts=1)
+
+    batch_id = manager.start_preview([repository(n) for n in range(1, 7)], "old", "new", "docs")
+    batch = wait_for(manager, batch_id, {BatchState.READY})
+
+    assert adapter.reads == ["owner/repo-1"]
+    assert all(item.preview_state is PreviewState.READ_FAILED for item in batch.items)

@@ -26,6 +26,7 @@ def test_report_contains_results_but_no_sensitive_content(tmp_path):
                 preview_state=PreviewState.READY,
                 commit_state=CommitState.SUCCESS,
                 commit_info=CommitInfo("commit-1", "https://gitee.com/commit/1"),
+                reconciled=True,
             ),
             BatchItem(repository=repo, preview_state=PreviewState.NO_MATCH),
             BatchItem(
@@ -53,6 +54,7 @@ def test_report_contains_results_but_no_sensitive_content(tmp_path):
         "match_count": 1,
         "commit_sha": "commit-1",
         "commit_url": "https://gitee.com/commit/1",
+        "reconciled": True,
         "error": None,
     }
     assert payload["items"][1]["preview_state"] == "no_match"

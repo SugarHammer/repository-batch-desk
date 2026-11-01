@@ -54,7 +54,8 @@ def services(tmp_path):
         credential_store=credentials,
         report_directory=tmp_path,
     )
-    return adapter, credentials, TestClient(app)
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    return adapter, credentials, client
 
 
 def start_session(client, remember=False):
@@ -175,3 +176,65 @@ def test_unknown_batch_is_safe_404(services):
 
     assert client.get("/api/batches/missing").status_code == 404
     assert client.post("/api/batches/missing/commit").status_code == 404
+
+
+def test_rebinding_host_is_rejected(services):
+    _, _, client = services
+
+    response = client.get("/api/health", headers={"Host": "attacker.example"})
+
+    assert response.status_code == 403
+
+
+def test_mutating_api_requires_process_token(services):
+    _, _, client = services
+
+    response = client.post(
+        "/api/session",
+        json={"token": TOKEN, "remember": False},
+        headers={"X-README-Batch-Token": ""},
+    )
+
+    assert response.status_code == 403
+
+
+def test_cross_origin_mutation_is_rejected(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.put(
+        "/api/draft",
+        json={"selected": [], "old": "old", "new": "new", "commit_message": "docs"},
+        headers={"Origin": "https://attacker.example", "Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert response.status_code == 403
+    assert adapter.updates == []
+
+
+def test_non_remembered_replacement_session_clears_saved_credential(services):
+    _, credentials, client = services
+    start_session(client, remember=True)
+    assert credentials.saved == TOKEN
+
+    start_session(client, remember=False)
+
+    assert credentials.saved is None
+
+
+def test_saved_session_reports_active(tmp_path):
+    adapter = FakeAdapter()
+    credentials = FakeCredentials()
+    credentials.saved = TOKEN
+    app = create_app(
+        client_factory=lambda token: adapter,
+        credential_store=credentials,
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+
+    response = client.get("/api/session")
+
+    assert response.status_code == 200
+    assert response.json() == {"active": True}

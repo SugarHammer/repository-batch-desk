@@ -49,6 +49,7 @@ class BatchItem:
     error: str | None = None
     commit_state: CommitState | None = None
     commit_info: CommitInfo | None = None
+    reconciled: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class BatchManager:
         self._batches: dict[str, Batch] = {}
         self._rules: dict[str, tuple[str, str]] = {}
         self._retryable_updates: set[tuple[str, str]] = set()
+        self._auth_failed = False
         self._revision = 0
 
     def start_preview(
@@ -115,14 +117,22 @@ class BatchManager:
             batch = self._require_current(batch_id)
             if batch.state is not BatchState.READY:
                 raise StalePreviewError("preview is not ready for commit")
+            items = [
+                item
+                for item in batch.items
+                if item.preview_state is PreviewState.READY and item.commit_state is None
+            ]
+            if not items:
+                raise StalePreviewError("no pending repository updates")
             self._batches[batch_id] = replace(batch, state=BatchState.COMMITTING)
-            items = [item for item in batch.items if item.preview_state is PreviewState.READY]
         for item in items:
             self._executor.submit(self._run_update, batch_id, item.repository)
 
     def start_retry(self, batch_id: str, full_name: str) -> None:
         with self._lock:
             batch = self._require_current(batch_id)
+            if batch.state in {BatchState.PREVIEWING, BatchState.COMMITTING}:
+                raise StalePreviewError("batch is still running")
             item = self._find_item(batch, full_name)
             if item.preview_state is PreviewState.READ_FAILED:
                 old, new = self._rules[batch_id]
@@ -152,6 +162,14 @@ class BatchManager:
                     self._batches[batch_id] = replace(batch, state=BatchState.STALE)
 
     def _run_read(self, batch_id: str, repo: Repository, old: str, new: str) -> None:
+        if self._auth_failed:
+            self._finish_preview(
+                batch_id,
+                repo.full_name,
+                preview_state=PreviewState.READ_FAILED,
+                error="Authentication failed; queued request stopped",
+            )
+            return
         try:
             snapshot = self._read_with_retries(repo)
             result = replace_literal(snapshot.content, old, new)
@@ -181,6 +199,8 @@ class BatchManager:
                 error=None,
             )
         except PlatformError as error:
+            if error.kind is ErrorKind.AUTH:
+                self._auth_failed = True
             state = PreviewState.NO_MATCH if error.kind is ErrorKind.NOT_FOUND else PreviewState.READ_FAILED
             self._finish_preview(batch_id, repo.full_name, preview_state=state, error=str(error))
         except Exception:
@@ -192,6 +212,14 @@ class BatchManager:
             )
 
     def _run_update(self, batch_id: str, repo: Repository) -> None:
+        if self._auth_failed:
+            self._finish_commit(
+                batch_id,
+                repo.full_name,
+                commit_state=CommitState.FAILED,
+                error="Authentication failed; queued request stopped",
+            )
+            return
         batch = self.get_batch(batch_id)
         item = self._find_item(batch, repo.full_name)
         for attempt in range(self._max_attempts):
@@ -209,7 +237,20 @@ class BatchManager:
                 )
                 return
             except PlatformError as error:
+                if error.kind is ErrorKind.AUTH:
+                    self._auth_failed = True
                 retryable = error.kind in {ErrorKind.TEMPORARY, ErrorKind.RATE_LIMIT}
+                uncertain = retryable or error.kind is ErrorKind.CONFLICT
+                if uncertain and self._remote_matches(repo, item.new_content):
+                    self._retryable_updates.discard((batch_id, repo.full_name))
+                    self._finish_commit(
+                        batch_id,
+                        repo.full_name,
+                        commit_state=CommitState.SUCCESS,
+                        reconciled=True,
+                        error=None,
+                    )
+                    return
                 if retryable and attempt + 1 < self._max_attempts:
                     self._sleep_before_retry(attempt, error.retry_after)
                     continue
@@ -231,6 +272,12 @@ class BatchManager:
                     error="README update failed",
                 )
                 return
+
+    def _remote_matches(self, repo: Repository, expected_content: str) -> bool:
+        try:
+            return self._adapter.read_readme(repo).content == expected_content
+        except PlatformError:
+            return False
 
     def _read_with_retries(self, repo: Repository) -> FileSnapshot:
         for attempt in range(self._max_attempts):
