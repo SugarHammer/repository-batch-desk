@@ -603,21 +603,31 @@ def test_upload_tab_preserves_files_and_renames_are_text(page, site):
     assert page.evaluate("window.__readmeXss") is None
 
 
-def test_select_all_uses_current_filter_and_preserves_other_selection(page, site):
+def test_select_all_toggles_between_select_and_clear_current_filter(page, site):
     _, base_url = site
     connect_and_load(page, base_url)
     select_repo(page, "owner/repo-1")
     page.locator("#repository-filter").fill("repo-2")
+    expect(page.locator("#select-all-repositories")).to_have_text("全选")
 
     page.locator("#select-all-repositories").click()
 
     expect(page.locator('.repository-row[data-full-name="owner/repo-2"] input')).to_be_checked()
-    page.locator("#repository-filter").fill("")
+    expect(page.locator("#select-all-repositories")).to_have_text("取消全选")
+    page.locator("#select-all-repositories").click()
+    expect(page.locator('.repository-row[data-full-name="owner/repo-2"] input')).not_to_be_checked()
     expect(page.locator('.repository-row[data-full-name="owner/repo-1"] input')).to_be_checked()
+    expect(page.locator("#select-all-repositories")).to_have_text("全选")
+
+    page.locator("#repository-filter").fill("")
     expect(page.locator('.repository-row[data-full-name="owner/repo-3"] input')).not_to_be_checked()
     expect(page.locator('.repository-row[data-full-name="owner/repo-4"] input')).not_to_be_checked()
-
     page.locator("#select-all-repositories").click()
     expect(page.locator(".repository-row input:checked")).to_have_count(4)
+    expect(page.locator("#select-all-repositories")).to_have_text("取消全选")
     page.locator("#tab-settings").click()
     expect(page.locator(".setting-row")).to_have_count(4)
+
+    page.locator("#select-all-repositories").click()
+    expect(page.locator(".repository-row input:checked")).to_have_count(0)
+    expect(page.locator("#select-all-repositories")).to_have_text("全选")

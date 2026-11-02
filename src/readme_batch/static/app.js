@@ -55,6 +55,7 @@ function renderRepositories() {
       else selected.delete(repository.full_name);
       draftChanged();
       document.dispatchEvent(new Event("repository-selection-changed"));
+      updateSelectAllButton();
     });
     const text = document.createElement("span");
     const name = document.createElement("span");
@@ -70,22 +71,37 @@ function renderRepositories() {
   filterRepositories();
 }
 
+function visibleRepositoryRows() {
+  return Array.from(document.querySelectorAll(".repository-row")).filter((row) => !row.hidden);
+}
+
+function allFilteredRepositoriesSelected() {
+  const rows = visibleRepositoryRows();
+  return rows.length > 0 && rows.every((row) => selected.has(row.dataset.fullName));
+}
+
+function updateSelectAllButton() {
+  byId("select-all-repositories").textContent = allFilteredRepositoriesSelected() ? "取消全选" : "全选";
+}
+
 function filterRepositories() {
   const query = byId("repository-filter").value.trim().toLowerCase();
   document.querySelectorAll(".repository-row").forEach((row) => {
     row.hidden = !row.dataset.fullName.toLowerCase().includes(query);
   });
+  updateSelectAllButton();
 }
 
 function selectAllFilteredRepositories() {
-  document.querySelectorAll(".repository-row").forEach((row) => {
-    if (!row.hidden) {
-      selected.add(row.dataset.fullName);
-      row.querySelector("input").checked = true;
-    }
+  const shouldSelect = !allFilteredRepositoriesSelected();
+  visibleRepositoryRows().forEach((row) => {
+    if (shouldSelect) selected.add(row.dataset.fullName);
+    else selected.delete(row.dataset.fullName);
+    row.querySelector("input").checked = shouldSelect;
   });
   draftChanged();
   document.dispatchEvent(new Event("repository-selection-changed"));
+  updateSelectAllButton();
 }
 
 function currentDraft() {
