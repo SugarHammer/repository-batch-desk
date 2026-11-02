@@ -77,6 +77,17 @@ function filterRepositories() {
   });
 }
 
+function selectAllFilteredRepositories() {
+  document.querySelectorAll(".repository-row").forEach((row) => {
+    if (!row.hidden) {
+      selected.add(row.dataset.fullName);
+      row.querySelector("input").checked = true;
+    }
+  });
+  draftChanged();
+  document.dispatchEvent(new Event("repository-selection-changed"));
+}
+
 function currentDraft() {
   return {
     selected: Array.from(selected),
@@ -268,6 +279,7 @@ byId("connect").addEventListener("click", connect);
 byId("preview").addEventListener("click", createPreview);
 byId("commit").addEventListener("click", commitBatch);
 byId("repository-filter").addEventListener("input", filterRepositories);
+byId("select-all-repositories").addEventListener("click", selectAllFilteredRepositories);
 ["old-text", "new-text", "commit-message"].forEach((id) => {
   byId(id).addEventListener("input", draftChanged);
 });

@@ -83,6 +83,10 @@ textarea { resize: vertical; min-height: 130px; font: 13px/1.65 var(--mono); }
 .status, .hint, .empty, .summary { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .status { min-height: 19px; margin: 12px 0 0; }
 
+.repository-tools { display: flex; align-items: stretch; gap: 8px; }
+.repository-tools input { flex: 1; min-width: 0; }
+.select-all-button { flex-shrink: 0; padding: 0 12px; color: var(--ink); background: #fbfaf5; border: 1px solid #c9c6bb; cursor: pointer; font-size: 12px; }
+.select-all-button:hover { border-color: var(--accent); color: var(--accent-dark); }
 .repository-list { max-height: 440px; overflow: auto; margin-top: 14px; border-top: 1px solid var(--line); }
 .repository-row { display: flex; gap: 10px; align-items: flex-start; padding: 12px 4px; border-bottom: 1px solid #e6e2d8; cursor: pointer; }
 .repository-row input { margin-top: 3px; accent-color: var(--accent); }

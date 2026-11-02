@@ -31,7 +31,10 @@
       <section class="panel repositories-panel">
         <div class="section-heading"><span>02</span><h2>选择仓库</h2></div>
         <label for="repository-filter">筛选仓库</label>
-        <input id="repository-filter" type="search" placeholder="按名称筛选">
+        <div class="repository-tools">
+          <input id="repository-filter" type="search" placeholder="按名称筛选">
+          <button id="select-all-repositories" class="select-all-button" type="button">全选</button>
+        </div>
         <div id="repository-list" class="repository-list" aria-live="polite">
           <p class="empty">连接后，仓库将出现在这里。</p>
         </div>

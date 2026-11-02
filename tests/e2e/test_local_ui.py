@@ -601,3 +601,23 @@ def test_upload_tab_preserves_files_and_renames_are_text(page, site):
     expect(page.locator("#upload-operation-items .badge.success")).to_have_count(1)
     expect(page.locator("img")).to_have_count(0)
     assert page.evaluate("window.__readmeXss") is None
+
+
+def test_select_all_uses_current_filter_and_preserves_other_selection(page, site):
+    _, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#repository-filter").fill("repo-2")
+
+    page.locator("#select-all-repositories").click()
+
+    expect(page.locator('.repository-row[data-full-name="owner/repo-2"] input')).to_be_checked()
+    page.locator("#repository-filter").fill("")
+    expect(page.locator('.repository-row[data-full-name="owner/repo-1"] input')).to_be_checked()
+    expect(page.locator('.repository-row[data-full-name="owner/repo-3"] input')).not_to_be_checked()
+    expect(page.locator('.repository-row[data-full-name="owner/repo-4"] input')).not_to_be_checked()
+
+    page.locator("#select-all-repositories").click()
+    expect(page.locator(".repository-row input:checked")).to_have_count(4)
+    page.locator("#tab-settings").click()
+    expect(page.locator(".setting-row")).to_have_count(4)
