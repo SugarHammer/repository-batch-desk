@@ -443,3 +443,58 @@ def test_second_attempt_reconciles_before_post_or_conflict(overwrite):
     assert failed == []
     assert succeeded[0].reconciled is True
     assert len(commit_route.calls) == 1
+
+
+@respx.mock
+def test_upload_preflight_conflict_does_not_decode_remote_content():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        return_value=httpx.Response(200, json={"type": "file", "content": None})
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).upload_files(
+            repository(), (UploadFile("photo/data.bin", b"new"),), False, "chore: upload"
+        )
+
+    assert caught.value.kind is ErrorKind.CONFLICT
+    assert not commit_route.called
+
+
+@respx.mock
+def test_upload_overwrite_preflight_does_not_require_content_field():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        return_value=httpx.Response(200, json={"type": "file"})
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    result = GiteeClient(TOKEN).upload_files(
+        repository(), (UploadFile("photo/data.bin", b"new"),), True, "chore: upload"
+    )
+
+    assert result.commit_info.sha == "commit-1"
+    assert commit_route.call_count == 1
+
+
+@respx.mock
+def test_malformed_remote_base64_does_not_reconcile_empty_upload():
+    malformed = content_payload("photo/data.bin", b"")
+    malformed["content"] = "!!!"
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        side_effect=[httpx.Response(404), httpx.Response(200, json=malformed)]
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).upload_files(
+            repository(), (UploadFile("photo/data.bin", b""),), False, "chore: upload"
+        )
+
+    assert caught.value.kind is ErrorKind.TEMPORARY
+    assert commit_route.call_count == 1

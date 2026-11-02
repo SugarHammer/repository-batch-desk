@@ -129,7 +129,7 @@ class GiteeClient:
         if reconcile_before and self._remote_files_match(repository, files):
             return UploadResult(commit_info=None, reconciled=True)
         exists = {
-            file.path: self._read_file_content(repository, file.path) is not None
+            file.path: self._file_exists(repository, file.path)
             for file in files
         }
         if not overwrite and any(exists.values()):
@@ -171,6 +171,19 @@ class GiteeClient:
         except (KeyError, TypeError, ValueError):
             raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
 
+    def _file_exists(self, repository: Repository, path: str) -> bool:
+        try:
+            self._request(
+                "GET",
+                f"/repos/{repository.owner}/{repository.name}/contents/{quote(path, safe='/')}",
+                params={"access_token": self._token, "ref": repository.default_branch},
+            )
+            return True
+        except PlatformError as error:
+            if error.kind is ErrorKind.NOT_FOUND:
+                return False
+            raise
+
     def _read_file_content(self, repository: Repository, path: str) -> bytes | None:
         try:
             response = self._request(
@@ -183,7 +196,10 @@ class GiteeClient:
                 return None
             raise
         try:
-            return base64.b64decode(response.json()["content"])
+            content = response.json()["content"]
+            if not isinstance(content, str):
+                raise TypeError
+            return base64.b64decode("".join(content.split()), validate=True)
         except (KeyError, TypeError, ValueError, binascii.Error):
             raise PlatformError(ErrorKind.REQUEST, "File content could not be decoded safely") from None
 
