@@ -173,16 +173,26 @@ class GiteeClient:
 
     def _file_exists(self, repository: Repository, path: str) -> bool:
         try:
-            self._request(
+            response = self._request(
                 "GET",
                 f"/repos/{repository.owner}/{repository.name}/contents/{quote(path, safe='/')}",
                 params={"access_token": self._token, "ref": repository.default_branch},
             )
-            return True
         except PlatformError as error:
             if error.kind is ErrorKind.NOT_FOUND:
                 return False
             raise
+        try:
+            payload = response.json()
+        except ValueError:
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee file response") from None
+        if payload == []:
+            return False
+        if isinstance(payload, dict) and payload.get("type") == "file":
+            return True
+        if isinstance(payload, (dict, list)):
+            raise PlatformError(ErrorKind.CONFLICT, "目标路径不是普通文件")
+        raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee file response")
 
     def _read_file_content(self, repository: Repository, path: str) -> bytes | None:
         try:

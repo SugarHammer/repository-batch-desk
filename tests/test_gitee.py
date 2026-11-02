@@ -498,3 +498,40 @@ def test_malformed_remote_base64_does_not_reconcile_empty_upload():
 
     assert caught.value.kind is ErrorKind.TEMPORARY
     assert commit_route.call_count == 1
+
+
+@respx.mock
+def test_upload_empty_list_means_file_does_not_exist():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/new.png").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    result = GiteeClient(TOKEN).upload_files(
+        repository(), (UploadFile("photo/new.png", b"image"),), False, "chore: upload"
+    )
+
+    assert result.commit_info.sha == "commit-1"
+    actions = json.loads(commit_route.calls[0].request.content)["actions"]
+    assert actions[0]["action"] == "create"
+
+
+@respx.mock
+def test_upload_directory_path_is_rejected_as_not_a_file():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo").mock(
+        return_value=httpx.Response(200, json=[{"type": "file", "name": "child.png"}])
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).upload_files(
+            repository(), (UploadFile("photo", b"image"),), False, "chore: upload"
+        )
+
+    assert caught.value.kind is ErrorKind.CONFLICT
+    assert str(caught.value) == "目标路径不是普通文件"
+    assert not commit_route.called
