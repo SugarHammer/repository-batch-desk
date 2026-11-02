@@ -122,6 +122,12 @@ select:focus { border-color: var(--accent); outline: none; box-shadow: 3px 3px 0
 .change-item { padding: 10px 12px; color: var(--ink); background: #fbfaf5; border-left: 3px solid var(--accent); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .badge.running { color: #fff; background: var(--accent); }
 
+input[type="file"] { width: 100%; padding: 12px; color: var(--ink); background: #fbfaf5; border: 1px dashed #c9c6bb; font: inherit; }
+.upload-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.upload-file-item { padding: 8px 10px; color: var(--muted); background: #fbfaf5; border-left: 3px solid var(--green); font: 12px/1.5 var(--mono); overflow-wrap: anywhere; }
+.reconciled { color: var(--green); font: 12px var(--mono); }
+.operation-tabs { overflow-x: auto; }
+
 footer { padding: 18px clamp(24px, 5vw, 72px); color: #778078; border-top: 1px solid var(--line); font-size: 9px; }
 footer span { color: var(--accent); }
 @keyframes arrive { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }

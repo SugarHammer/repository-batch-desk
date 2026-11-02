@@ -108,3 +108,33 @@ def test_operation_report_contains_public_results_without_parameter_snapshot(tmp
     assert "access_token" not in serialized
     assert "names" not in payload
     assert "labels" not in payload
+
+
+def test_upload_report_contains_commit_and_reconciliation_without_file_snapshot(tmp_path):
+    repo = Repository("owner", "repo", "owner/repo", "main", "https://gitee.com/owner/repo")
+    operation = Operation(
+        id="upload-123",
+        kind=OperationKind.UPLOAD,
+        revision=0,
+        state=OperationState.COMPLETE,
+        created_at=datetime(2026, 11, 2, tzinfo=timezone.utc),
+        items=(
+            OperationItem(
+                repository=repo,
+                state=OperationItemState.SUCCESS,
+                commit_info=CommitInfo("commit-1", "https://example/commit/1"),
+                reconciled=True,
+            ),
+        ),
+    )
+
+    path = JsonReportStore(tmp_path).save_operation(operation)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["kind"] == "upload"
+    assert payload["items"][0]["state"] == "success"
+    assert payload["items"][0]["commit_sha"] == "commit-1"
+    assert payload["items"][0]["commit_url"] == "https://example/commit/1"
+    assert payload["items"][0]["reconciled"] is True
+    assert "files" not in payload
+    assert "content_base64" not in path.read_text(encoding="utf-8")

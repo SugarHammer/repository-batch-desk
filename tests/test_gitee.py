@@ -1,12 +1,14 @@
 import base64
 import json
+import threading
 from urllib.parse import parse_qs
 
 import httpx
 import pytest
 import respx
 
-from readme_batch.models import FileSnapshot, Repository
+from readme_batch.execution import RepositoryExecutor
+from readme_batch.models import FileSnapshot, Repository, UploadFile
 from readme_batch.platforms.base import ErrorKind, PlatformError
 from readme_batch.platforms.gitee import GiteeClient
 
@@ -260,3 +262,184 @@ def test_add_project_labels_posts_json_array():
     GiteeClient(TOKEN).add_project_labels(repository(), ("Java", "Spring Boot"))
 
     assert json.loads(route.calls[0].request.content) == ["Java", "Spring Boot"]
+
+
+def content_payload(path, content):
+    return {
+        "type": "file",
+        "encoding": "base64",
+        "size": len(content),
+        "name": path.rsplit("/", 1)[-1],
+        "path": path,
+        "content": base64.b64encode(content).decode("ascii"),
+        "sha": "blob-1",
+        "url": f"{API}/repos/owner/repo-1/contents/{path}",
+        "html_url": f"https://gitee.com/owner/repo-1/blob/main/{path}",
+    }
+
+
+@respx.mock
+def test_upload_files_creates_one_commit_with_binary_base64_and_encoded_paths():
+    files = (
+        UploadFile("photo/图片.png", b"\x00\xff"),
+        UploadFile("photo/data.bin", b"\x01\x00"),
+    )
+    encoded_route = respx.get(f"{API}/repos/owner/repo-1/contents/photo/图片.png").mock(
+        return_value=httpx.Response(404)
+    )
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        return_value=httpx.Response(404)
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(
+            200, json={"sha": "commit-1", "html_url": "https://example/commit/1"}
+        )
+    )
+
+    result = GiteeClient(TOKEN).upload_files(repository(), files, False, "chore: upload")
+
+    assert result.commit_info.sha == "commit-1"
+    assert result.commit_info.url == "https://example/commit/1"
+    assert result.reconciled is False
+    assert len(commit_route.calls) == 1
+    payload = json.loads(commit_route.calls[0].request.content)
+    assert payload["branch"] == "main"
+    assert payload["message"] == "chore: upload"
+    assert payload["actions"] == [
+        {
+            "action": "create",
+            "path": "photo/图片.png",
+            "content": base64.b64encode(b"\x00\xff").decode("ascii"),
+            "encoding": "base64",
+        },
+        {
+            "action": "create",
+            "path": "photo/data.bin",
+            "content": base64.b64encode(b"\x01\x00").decode("ascii"),
+            "encoding": "base64",
+        },
+    ]
+    assert "%E5%9B%BE%E7%89%87.png" in str(encoded_route.calls[0].request.url)
+
+
+@respx.mock
+def test_upload_files_conflict_does_not_commit():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        return_value=httpx.Response(200, json=content_payload("photo/data.bin", b"old"))
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).upload_files(
+            repository(), (UploadFile("photo/data.bin", b"new"),), False, "chore: upload"
+        )
+
+    assert caught.value.kind is ErrorKind.CONFLICT
+    assert not commit_route.called
+
+
+@respx.mock
+def test_upload_files_overwrite_uses_update_and_create():
+    files = (
+        UploadFile("photo/existing.bin", b"new"),
+        UploadFile("photo/new.bin", b"\x00\xff"),
+    )
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/existing.bin").mock(
+        return_value=httpx.Response(200, json=content_payload("photo/existing.bin", b"old"))
+    )
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/new.bin").mock(
+        return_value=httpx.Response(404)
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(200, json={"sha": "commit-1"})
+    )
+
+    GiteeClient(TOKEN).upload_files(repository(), files, True, "chore: upload")
+
+    actions = json.loads(commit_route.calls[0].request.content)["actions"]
+    assert [action["action"] for action in actions] == ["update", "create"]
+    assert len(commit_route.calls) == 1
+
+
+@respx.mock
+def test_lost_upload_response_reconciles_matching_bytes_without_second_commit():
+    content = b"\x00\xff"
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        side_effect=[
+            httpx.Response(404),
+            httpx.Response(200, json=content_payload("photo/data.bin", content)),
+        ]
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(500)
+    )
+
+    result = GiteeClient(TOKEN).upload_files(
+        repository(), (UploadFile("photo/data.bin", content),), False, "chore: upload"
+    )
+
+    assert result.commit_info is None
+    assert result.reconciled is True
+    assert len(commit_route.calls) == 1
+
+
+@respx.mock
+def test_lost_upload_response_with_different_content_remains_temporary():
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        side_effect=[
+            httpx.Response(404),
+            httpx.Response(200, json=content_payload("photo/data.bin", b"different")),
+        ]
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(500)
+    )
+
+    with pytest.raises(PlatformError) as caught:
+        GiteeClient(TOKEN).upload_files(
+            repository(), (UploadFile("photo/data.bin", b"new"),), False, "chore: upload"
+        )
+
+    assert caught.value.kind is ErrorKind.TEMPORARY
+    assert len(commit_route.calls) == 1
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+@respx.mock
+def test_second_attempt_reconciles_before_post_or_conflict(overwrite):
+    content = b"\x00\xff"
+    respx.get(f"{API}/repos/owner/repo-1/contents/photo/data.bin").mock(
+        side_effect=[
+            httpx.Response(404),
+            httpx.Response(500),
+            httpx.Response(200, json=content_payload("photo/data.bin", content)),
+        ]
+    )
+    commit_route = respx.post(f"{API}/repos/owner/repo-1/commits").mock(
+        return_value=httpx.Response(500)
+    )
+    client = GiteeClient(TOKEN)
+    executor = RepositoryExecutor(max_workers=1, max_attempts=2, sleeper=lambda _: None)
+    succeeded = []
+    failed = []
+    done = threading.Event()
+
+    executor.submit(
+        [repository()],
+        lambda repo, attempt: client.upload_files(
+            repo,
+            (UploadFile("photo/data.bin", content),),
+            overwrite,
+            "chore: upload",
+            reconcile_before=attempt > 0,
+        ),
+        lambda repo, result: (succeeded.append(result), done.set()),
+        lambda repo, error, retryable: (failed.append(error), done.set()),
+    )
+
+    assert done.wait(3)
+    assert failed == []
+    assert succeeded[0].reconciled is True
+    assert len(commit_route.calls) == 1

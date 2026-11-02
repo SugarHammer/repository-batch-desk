@@ -10,10 +10,11 @@ const operationStateLabels = {
   running: "执行中",
   success: "成功",
   failed: "失败",
+  conflict: "冲突",
 };
 
 function selectOperationView(view) {
-  ["readme", "settings", "labels"].forEach((name) => {
+  ["readme", "settings", "labels", "upload"].forEach((name) => {
     byId(`view-${name}`).hidden = name !== view;
     byId(`tab-${name}`).setAttribute("aria-selected", String(name === view));
   });
@@ -157,8 +158,12 @@ async function submitLabels() {
   });
 }
 
+function enableOperationSubmit(kind) {
+  byId(`${kind}-submit`).disabled = kind === "settings" ? settingsChanges.length === 0 : false;
+}
+
 async function startOperation(kind, path, payload) {
-  byId(kind === "settings" ? "settings-submit" : "labels-submit").disabled = true;
+  byId(`${kind}-submit`).disabled = true;
   operationRefreshed[kind] = false;
   operationPollFailures[kind] = 0;
   try {
@@ -167,8 +172,7 @@ async function startOperation(kind, path, payload) {
     await pollOperation(kind);
   } catch (error) {
     byId(`${kind}-summary`).textContent = error.message;
-    if (kind === "labels") byId("labels-submit").disabled = false;
-    if (kind === "settings") byId("settings-submit").disabled = settingsChanges.length === 0;
+    enableOperationSubmit(kind);
   }
 }
 
@@ -186,7 +190,7 @@ async function pollOperation(kind) {
       operationTimers[kind] = setTimeout(() => pollOperation(kind), 150);
       return;
     }
-    if (kind === "labels") byId("labels-submit").disabled = false;
+    if (kind !== "settings") enableOperationSubmit(kind);
     if (kind === "settings" && !operationRefreshed[kind]) {
       operationRefreshed[kind] = true;
       await loadRepositories(true);
@@ -195,8 +199,7 @@ async function pollOperation(kind) {
     if (operationIds[kind] !== id) return;
     byId(`${kind}-summary`).textContent = error.message;
     if ([401, 404].includes(error.status)) {
-      if (kind === "labels") byId("labels-submit").disabled = false;
-      if (kind === "settings") byId("settings-submit").disabled = settingsChanges.length === 0;
+      enableOperationSubmit(kind);
       return;
     }
     operationPollFailures[kind] += 1;
@@ -230,6 +233,26 @@ function renderOperation(kind, operation) {
       error.textContent = item.error;
       article.append(error);
     }
+    if (item.commit_info || item.reconciled) {
+      const row = document.createElement("div");
+      row.className = "result-row";
+      if (item.commit_info) {
+        const link = document.createElement("a");
+        link.className = "commit-link";
+        link.href = item.commit_info.url;
+        link.target = "_blank";
+        link.rel = "noreferrer";
+        link.textContent = `查看提交 ${item.commit_info.sha.slice(0, 8)}`;
+        row.append(link);
+      }
+      if (item.reconciled) {
+        const reconciled = document.createElement("span");
+        reconciled.className = "reconciled";
+        reconciled.textContent = "核对成功";
+        row.append(reconciled);
+      }
+      article.append(row);
+    }
     if (item.state === "failed" && item.retryable) {
       const row = document.createElement("div");
       row.className = "result-row";
@@ -260,12 +283,105 @@ async function retryOperation(kind, fullName) {
   }
 }
 
-["readme", "settings", "labels"].forEach((view) => {
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function renderUploadFileList() {
+  const container = byId("upload-file-list");
+  container.replaceChildren();
+  Array.from(byId("upload-files").files).forEach((file) => {
+    const item = document.createElement("div");
+    item.className = "upload-file-item";
+    item.textContent = `${file.name} · ${formatFileSize(file.size)}`;
+    container.append(item);
+  });
+}
+
+function validateUploadInput(files, directory, message) {
+  if (selected.size === 0) throw new Error("请先选择仓库");
+  if (files.length === 0) throw new Error("请选择要上传的文件");
+  if (files.length > 20) throw new Error("最多上传 20 个文件");
+  if (!message) throw new Error("提交说明不能为空");
+  if (
+    directory.includes("\\") || directory.startsWith("/") ||
+    (directory.length > 1 && directory[1] === ":") || /[\x00-\x1F]/.test(directory) ||
+    directory.split("/").some((part) => ["", ".", ".."].includes(part))
+  ) {
+    if (directory) throw new Error("目标目录必须是有效的仓库相对路径");
+  }
+  const names = new Set();
+  let totalSize = 0;
+  files.forEach((file) => {
+    const name = file.name.trim();
+    if (!name || [".", ".."].includes(name) || /[/\\]/.test(name) || /[\x00-\x1F]/.test(name)) {
+      throw new Error("文件名无效");
+    }
+    if (names.has(name)) throw new Error(`文件名重复：${name}`);
+    names.add(name);
+    if (file.size > 10 * 1024 * 1024) throw new Error(`${name} 超过单文件 10MiB 限制`);
+    totalSize += file.size;
+  });
+  if (totalSize > 25 * 1024 * 1024) throw new Error("文件总大小超过 25MiB 限制");
+  return { names, totalSize };
+}
+
+async function fileToBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function submitUpload() {
+  const files = Array.from(byId("upload-files").files);
+  const selectedRepositories = Array.from(selected);
+  const directory = byId("upload-directory").value.trim();
+  const overwrite = byId("upload-overwrite").checked;
+  const message = byId("upload-message").value.trim();
+  let totalSize = 0;
+  try {
+    totalSize = validateUploadInput(files, directory, message).totalSize;
+  } catch (error) {
+    byId("upload-summary").textContent = error.message;
+    return;
+  }
+  let confirmation = `将向 ${selectedRepositories.length} 个仓库上传 ${files.length} 个文件，共 ${formatFileSize(totalSize)}，目标目录：${directory || "仓库根目录"}。确认继续？`;
+  if (overwrite) confirmation = `已启用覆盖同名文件。\n${confirmation}`;
+  if (!window.confirm(confirmation)) return;
+
+  byId("upload-submit").disabled = true;
+  byId("upload-summary").textContent = "正在读取文件…";
+  try {
+    const payloadFiles = [];
+    for (const file of files) {
+      payloadFiles.push({ name: file.name.trim(), content_base64: await fileToBase64(file) });
+    }
+    await startOperation("upload", "/api/operations/uploads", {
+      selected: selectedRepositories,
+      directory,
+      overwrite,
+      message,
+      files: payloadFiles,
+    });
+  } catch (error) {
+    byId("upload-summary").textContent = error.message;
+    byId("upload-submit").disabled = false;
+  }
+}
+
+["readme", "settings", "labels", "upload"].forEach((view) => {
   byId(`tab-${view}`).addEventListener("click", () => selectOperationView(view));
 });
 byId("settings-preview").addEventListener("click", previewSettings);
 byId("settings-submit").addEventListener("click", submitSettings);
 byId("labels-submit").addEventListener("click", submitLabels);
+byId("upload-submit").addEventListener("click", submitUpload);
+byId("upload-files").addEventListener("change", renderUploadFileList);
 byId("visibility").addEventListener("change", invalidateSettingsPreview);
 byId("labels-input").addEventListener("input", () => {
   byId("labels-summary").textContent = "标签已编辑，确认后追加";

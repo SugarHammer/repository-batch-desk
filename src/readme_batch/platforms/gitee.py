@@ -1,9 +1,10 @@
 import base64
 import binascii
+from urllib.parse import quote
 
 import httpx
 
-from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadFile, UploadResult
 from readme_batch.platforms.base import ErrorKind, PlatformError
 
 API_URL = "https://gitee.com/api/v5"
@@ -116,6 +117,84 @@ class GiteeClient:
             return CommitInfo(sha=commit["sha"], url=url)
         except (KeyError, TypeError, ValueError):
             raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
+
+    def upload_files(
+        self,
+        repository: Repository,
+        files: tuple[UploadFile, ...],
+        overwrite: bool,
+        message: str,
+        reconcile_before: bool = False,
+    ) -> UploadResult:
+        if reconcile_before and self._remote_files_match(repository, files):
+            return UploadResult(commit_info=None, reconciled=True)
+        exists = {
+            file.path: self._read_file_content(repository, file.path) is not None
+            for file in files
+        }
+        if not overwrite and any(exists.values()):
+            raise PlatformError(ErrorKind.CONFLICT, "同名文件已存在")
+        actions = [
+            {
+                "action": "update" if exists[file.path] else "create",
+                "path": file.path,
+                "content": base64.b64encode(file.content).decode("ascii"),
+                "encoding": "base64",
+            }
+            for file in files
+        ]
+        try:
+            response = self._request(
+                "POST",
+                f"/repos/{repository.owner}/{repository.name}/commits",
+                params={"access_token": self._token},
+                json={
+                    "branch": repository.default_branch,
+                    "message": message,
+                    "actions": actions,
+                },
+            )
+        except PlatformError as error:
+            uncertain = error.kind in {
+                ErrorKind.TEMPORARY,
+                ErrorKind.RATE_LIMIT,
+                ErrorKind.CONFLICT,
+            }
+            if uncertain and self._remote_files_match(repository, files):
+                return UploadResult(commit_info=None, reconciled=True)
+            raise
+        try:
+            payload = response.json()
+            sha = payload["sha"]
+            url = payload.get("html_url") or f"{repository.html_url}/commit/{sha}"
+            return UploadResult(CommitInfo(sha=sha, url=url), reconciled=False)
+        except (KeyError, TypeError, ValueError):
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
+
+    def _read_file_content(self, repository: Repository, path: str) -> bytes | None:
+        try:
+            response = self._request(
+                "GET",
+                f"/repos/{repository.owner}/{repository.name}/contents/{quote(path, safe='/')}",
+                params={"access_token": self._token, "ref": repository.default_branch},
+            )
+        except PlatformError as error:
+            if error.kind is ErrorKind.NOT_FOUND:
+                return None
+            raise
+        try:
+            return base64.b64decode(response.json()["content"])
+        except (KeyError, TypeError, ValueError, binascii.Error):
+            raise PlatformError(ErrorKind.REQUEST, "File content could not be decoded safely") from None
+
+    def _remote_files_match(self, repository: Repository, files: tuple[UploadFile, ...]) -> bool:
+        try:
+            return all(
+                self._read_file_content(repository, file.path) == file.content
+                for file in files
+            )
+        except PlatformError:
+            return False
 
     def _request(
         self,

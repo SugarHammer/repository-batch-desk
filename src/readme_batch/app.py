@@ -1,3 +1,5 @@
+import base64
+import binascii
 import os
 import secrets
 from dataclasses import dataclass, field
@@ -11,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from readme_batch.batches import Batch, BatchManager, StalePreviewError
 from readme_batch.credentials import CredentialStore
-from readme_batch.models import Repository
+from readme_batch.models import Repository, UploadFile
 from readme_batch.operations import Operation, OperationManager, StaleOperationError
 from readme_batch.platforms.base import ErrorKind, PlatformError, RepositoryPlatform
 from readme_batch.platforms.gitee import GiteeClient
@@ -22,6 +24,7 @@ from readme_batch.schemas import (
     RetryRequest,
     SessionRequest,
     SettingsOperationRequest,
+    UploadOperationRequest,
 )
 
 
@@ -229,6 +232,48 @@ def create_app(
         operation_id = operations.start_labels(selected, labels)
         return {"id": operation_id}
 
+    @app.post("/api/operations/uploads", status_code=202)
+    def create_upload_operation(request: UploadOperationRequest) -> dict[str, str]:
+        operations = _require_operations(state)
+        selected = _selected_repositories(state, request.selected)
+        message = request.message.strip()
+        if not message:
+            raise HTTPException(400, "commit message must not be empty")
+        directory = _normalize_upload_directory(request.directory)
+        if not request.files:
+            raise HTTPException(400, "at least one file must be supplied")
+        if len(request.files) > 20:
+            raise HTTPException(413, "at most 20 files may be uploaded at once")
+        files = []
+        names = set()
+        total_size = 0
+        for item in request.files:
+            name = item.name.strip()
+            if (
+                not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\\" in name
+                or any(ord(character) < 32 for character in name)
+            ):
+                raise HTTPException(400, "invalid upload file name")
+            if name in names:
+                raise HTTPException(400, "duplicate upload file name")
+            names.add(name)
+            try:
+                content = base64.b64decode(item.content_base64, validate=True)
+            except (binascii.Error, ValueError):
+                raise HTTPException(400, "invalid Base64 file content") from None
+            if len(content) > 10 * 1024 * 1024:
+                raise HTTPException(413, "a single file exceeds the 10MiB limit")
+            total_size += len(content)
+            if total_size > 25 * 1024 * 1024:
+                raise HTTPException(413, "total upload size exceeds the 25MiB limit")
+            path = f"{directory}/{name}" if directory else name
+            files.append(UploadFile(path=path, content=content))
+        operation_id = operations.start_upload(selected, tuple(files), request.overwrite, message)
+        return {"id": operation_id}
+
     @app.get("/api/operations/{operation_id}")
     def get_operation(operation_id: str) -> dict:
         operations = _require_operations(state)
@@ -280,6 +325,23 @@ def _selected_repositories(state: AppState, selected: list[str]) -> list[Reposit
         raise HTTPException(400, "selected repository is not loaded") from None
 
 
+def _normalize_upload_directory(value: str) -> str:
+    directory = value.strip()
+    if not directory:
+        return ""
+    if (
+        "\\" in directory
+        or directory.startswith("/")
+        or (len(directory) > 1 and directory[1] == ":")
+        or any(ord(character) < 32 for character in directory)
+    ):
+        raise HTTPException(400, "invalid upload directory")
+    parts = directory.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise HTTPException(400, "invalid upload directory")
+    return "/".join(parts)
+
+
 def _platform_http_error(error: PlatformError) -> HTTPException:
     status = {
         ErrorKind.AUTH: 401,
@@ -311,16 +373,22 @@ def _operation_dict(operation: Operation) -> dict:
         "kind": operation.kind.value,
         "state": operation.state.value,
         "created_at": operation.created_at.isoformat(),
-        "items": [
-            {
-                "repository": _repository_dict(item.repository),
-                "state": item.state.value,
-                "error": item.error,
-                "retryable": item.retryable,
-            }
-            for item in operation.items
-        ],
+        "items": [_operation_item_dict(item) for item in operation.items],
     }
+
+
+def _operation_item_dict(item) -> dict:
+    payload = {
+        "repository": _repository_dict(item.repository),
+        "state": item.state.value,
+        "error": item.error,
+        "retryable": item.retryable,
+    }
+    if item.commit_info:
+        payload["commit_info"] = {"sha": item.commit_info.sha, "url": item.commit_info.url}
+    if item.reconciled:
+        payload["reconciled"] = True
+    return payload
 
 
 def _batch_dict(batch: Batch) -> dict:

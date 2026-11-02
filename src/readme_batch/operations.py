@@ -7,13 +7,14 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from readme_batch.execution import RepositoryExecutor
-from readme_batch.models import Repository
-from readme_batch.platforms.base import PlatformError, RepositoryPlatform
+from readme_batch.models import CommitInfo, Repository, UploadFile, UploadResult
+from readme_batch.platforms.base import ErrorKind, PlatformError, RepositoryPlatform
 
 
 class OperationKind(str, Enum):
     SETTINGS = "settings"
     LABELS = "labels"
+    UPLOAD = "upload"
 
 
 class OperationState(str, Enum):
@@ -26,6 +27,7 @@ class OperationItemState(str, Enum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
+    CONFLICT = "conflict"
 
 
 class StaleOperationError(Exception):
@@ -38,6 +40,8 @@ class OperationItem:
     state: OperationItemState = OperationItemState.PENDING
     error: str | None = None
     retryable: bool = False
+    commit_info: CommitInfo | None = None
+    reconciled: bool = False
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,7 @@ class OperationManager:
         max_attempts: int = 3,
         sleeper: Callable[[float], None] = time.sleep,
         on_complete: Callable[[Operation], object] | None = None,
+        max_retained_uploads: int = 4,
     ):
         self._adapter = adapter
         self._executor = RepositoryExecutor(max_workers, max_attempts, sleeper)
@@ -66,6 +71,8 @@ class OperationManager:
         self._operations: dict[str, Operation] = {}
         self._settings: dict[str, dict[str, tuple[str, bool | None]]] = {}
         self._labels: dict[str, tuple[str, ...]] = {}
+        self._uploads: dict[str, tuple[tuple[UploadFile, ...], bool, str]] = {}
+        self._max_retained_uploads = max_retained_uploads
         self._revision = 0
 
     def start_settings(
@@ -94,6 +101,19 @@ class OperationManager:
         self._submit(operation_id, repositories)
         return operation_id
 
+    def start_upload(
+        self,
+        repositories: list[Repository],
+        files: list[UploadFile] | tuple[UploadFile, ...],
+        overwrite: bool,
+        message: str,
+    ) -> str:
+        snapshot = tuple(UploadFile(file.path, bytes(file.content)) for file in files)
+        operation_id = self._create(OperationKind.UPLOAD, repositories)
+        self._uploads[operation_id] = (snapshot, overwrite, message)
+        self._submit(operation_id, repositories)
+        return operation_id
+
     def get_operation(self, operation_id: str) -> Operation:
         with self._lock:
             return self._operations[operation_id]
@@ -114,7 +134,7 @@ class OperationManager:
                 error=None,
                 retryable=False,
             )
-        self._submit(operation_id, [item.repository])
+        self._submit(operation_id, [item.repository], reconcile_before=True)
 
     def invalidate(self) -> None:
         with self._lock:
@@ -133,7 +153,12 @@ class OperationManager:
             )
         return operation_id
 
-    def _submit(self, operation_id: str, repositories: list[Repository]) -> None:
+    def _submit(
+        self,
+        operation_id: str,
+        repositories: list[Repository],
+        reconcile_before: bool = False,
+    ) -> None:
         def started(repo: Repository) -> None:
             self._finish_item(
                 operation_id,
@@ -144,39 +169,64 @@ class OperationManager:
                 require_pending=True,
             )
 
-        def succeeded(repo: Repository, result: None) -> None:
+        def succeeded(repo: Repository, result: UploadResult | None) -> None:
             self._finish_item(
                 operation_id,
                 repo.full_name,
                 state=OperationItemState.SUCCESS,
                 error=None,
                 retryable=False,
+                commit_info=result.commit_info if result else None,
+                reconciled=result.reconciled if result else False,
             )
 
         def failed(repo: Repository, error: PlatformError, retryable: bool) -> None:
+            state = (
+                OperationItemState.CONFLICT
+                if error.kind is ErrorKind.CONFLICT
+                else OperationItemState.FAILED
+            )
             self._finish_item(
                 operation_id,
                 repo.full_name,
-                state=OperationItemState.FAILED,
+                state=state,
                 error=str(error),
                 retryable=retryable,
             )
 
         self._executor.submit(
             repositories,
-            lambda repo: self._perform(operation_id, repo),
+            lambda repo, attempt: self._perform(
+                operation_id, repo, attempt, reconcile_before
+            ),
             succeeded,
             failed,
             on_start=started,
         )
 
-    def _perform(self, operation_id: str, repo: Repository) -> None:
+    def _perform(
+        self,
+        operation_id: str,
+        repo: Repository,
+        attempt: int,
+        reconcile_before: bool,
+    ) -> UploadResult | None:
         operation = self.get_operation(operation_id)
         if operation.kind is OperationKind.SETTINGS:
             display_name, private = self._settings[operation_id][repo.full_name]
             self._adapter.update_repository_settings(repo, display_name, private)
-        else:
+        elif operation.kind is OperationKind.LABELS:
             self._adapter.add_project_labels(repo, self._labels[operation_id])
+        else:
+            files, overwrite, message = self._uploads[operation_id]
+            return self._adapter.upload_files(
+                repo,
+                files,
+                overwrite,
+                message,
+                reconcile_before=reconcile_before or attempt > 0,
+            )
+        return None
 
     def _finish_item(
         self,
@@ -194,13 +244,40 @@ class OperationManager:
             self._replace_item(operation_id, full_name, **changes)
             operation = self._operations[operation_id]
             if operation.state is OperationState.RUNNING and all(
-                item.state in {OperationItemState.SUCCESS, OperationItemState.FAILED}
+                item.state in {
+                    OperationItemState.SUCCESS,
+                    OperationItemState.FAILED,
+                    OperationItemState.CONFLICT,
+                }
                 for item in operation.items
             ):
                 completed = replace(operation, state=OperationState.COMPLETE)
                 self._operations[operation_id] = completed
+                if completed.kind is OperationKind.UPLOAD:
+                    if not any(item.retryable for item in completed.items):
+                        self._uploads.pop(operation_id, None)
+                    self._trim_upload_snapshots()
         if completed is not None and self._on_complete is not None:
             self._on_complete(completed)
+
+    def _trim_upload_snapshots(self) -> None:
+        while len(self._uploads) > self._max_retained_uploads:
+            oldest = next(
+                (
+                    operation_id
+                    for operation_id in self._uploads
+                    if self._operations[operation_id].state is OperationState.COMPLETE
+                ),
+                None,
+            )
+            if oldest is None:
+                return
+            self._uploads.pop(oldest)
+            operation = self._operations[oldest]
+            self._operations[oldest] = replace(
+                operation,
+                items=tuple(replace(item, retryable=False) for item in operation.items),
+            )
 
     def _replace_item(self, operation_id: str, full_name: str, **changes) -> None:
         operation = self._operations[operation_id]

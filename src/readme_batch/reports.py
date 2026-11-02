@@ -52,16 +52,7 @@ class JsonReportStore:
             "kind": operation.kind.value,
             "created_at": operation.created_at.isoformat(),
             "state": operation.state.value,
-            "items": [
-                {
-                    "full_name": item.repository.full_name,
-                    "default_branch": item.repository.default_branch,
-                    "state": item.state.value,
-                    "error": item.error,
-                    "retryable": item.retryable,
-                }
-                for item in operation.items
-            ],
+            "items": [_operation_item_dict(item) for item in operation.items],
         }
         try:
             temporary.write_text(
@@ -71,3 +62,19 @@ class JsonReportStore:
         finally:
             temporary.unlink(missing_ok=True)
         return path
+
+
+def _operation_item_dict(item) -> dict:
+    payload = {
+        "full_name": item.repository.full_name,
+        "default_branch": item.repository.default_branch,
+        "state": item.state.value,
+        "error": item.error,
+        "retryable": item.retryable,
+    }
+    if item.commit_info:
+        payload["commit_sha"] = item.commit_info.sha
+        payload["commit_url"] = item.commit_info.url
+    if item.reconciled:
+        payload["reconciled"] = True
+    return payload

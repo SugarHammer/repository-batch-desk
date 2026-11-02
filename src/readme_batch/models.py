@@ -27,6 +27,18 @@ class CommitInfo:
 
 
 @dataclass(frozen=True)
+class UploadFile:
+    path: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class UploadResult:
+    commit_info: CommitInfo | None
+    reconciled: bool
+
+
+@dataclass(frozen=True)
 class ReplacementResult:
     content: str
     match_count: int

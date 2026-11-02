@@ -1,10 +1,11 @@
+import base64
 import time
 
 import pytest
 from fastapi.testclient import TestClient
 
 from readme_batch.app import create_app
-from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadResult
 from readme_batch.platforms.base import ErrorKind, PlatformError
 
 TOKEN = "test-api-token"
@@ -25,6 +26,7 @@ class FakeAdapter:
         self.updates = []
         self.settings_calls = []
         self.label_calls = []
+        self.upload_calls = []
         self.settings_errors = {}
         self.label_errors = {}
 
@@ -50,6 +52,10 @@ class FakeAdapter:
         errors = self.label_errors.get(repository.full_name, [])
         if errors:
             raise errors.pop(0)
+
+    def upload_files(self, repository, files, overwrite, message, reconcile_before=False):
+        self.upload_calls.append((repository.full_name, files, overwrite, message))
+        return UploadResult(CommitInfo("commit-1", "https://example/commit/1"), False)
 
 
 class FakeCredentials:
@@ -418,3 +424,149 @@ def test_operation_mutations_require_process_token(services):
 
     assert response.status_code == 403
     assert adapter.label_calls == []
+
+
+def upload_file_payload(name, content=b""):
+    return {"name": name, "content_base64": base64.b64encode(content).decode("ascii")}
+
+
+def test_upload_operation_accepts_binary_and_empty_files(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "directory": "photo/common",
+            "overwrite": True,
+            "message": "chore: upload",
+            "files": [
+                upload_file_payload("hello.txt", b"hello"),
+                upload_file_payload("empty.bin", b""),
+                upload_file_payload("图片.png", b"\x00\xff"),
+            ],
+        },
+    )
+
+    assert response.status_code == 202
+    operation = wait_for_operation(client, response.json()["id"])
+    _, files, overwrite, message = adapter.upload_calls[0]
+    assert [(file.path, file.content) for file in files] == [
+        ("photo/common/hello.txt", b"hello"),
+        ("photo/common/empty.bin", b""),
+        ("photo/common/图片.png", b"\x00\xff"),
+    ]
+    assert overwrite is True
+    assert message == "chore: upload"
+    assert operation["items"][0]["commit_info"]["url"] == "https://example/commit/1"
+    assert "aGVsbG8=" not in str(operation)
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "files": [upload_file_payload("root.txt", b"root")],
+            "message": "chore: root",
+        },
+    )
+    wait_for_operation(client, response.json()["id"])
+    assert adapter.upload_calls[-1][1][0].path == "root.txt"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"files": [{"name": "a.txt", "content_base64": "not-base64"}]},
+        {"files": [upload_file_payload(" ")]},
+        {"files": [upload_file_payload("a.txt"), upload_file_payload(" a.txt ")]},
+        {"files": [upload_file_payload("a/b.txt")]},
+        {"files": [upload_file_payload("a\\b.txt")]},
+        {"files": [upload_file_payload("a\n.txt")]},
+        {"files": [upload_file_payload(".")]},
+        {"files": [upload_file_payload("..")]},
+        {"directory": "/root", "files": [upload_file_payload("a.txt")]},
+        {"directory": "C:\\root", "files": [upload_file_payload("a.txt")]},
+        {"directory": "photo//common", "files": [upload_file_payload("a.txt")]},
+        {"directory": "photo/../common", "files": [upload_file_payload("a.txt")]},
+        {"directory": "photo\\common", "files": [upload_file_payload("a.txt")]},
+        {"message": "  ", "files": [upload_file_payload("a.txt")]},
+        {"files": []},
+        {"selected": ["owner/unknown"], "files": [upload_file_payload("a.txt")]},
+    ],
+)
+def test_invalid_upload_requests_do_not_create_tasks(services, payload):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+    request = {
+        "selected": ["owner/repo-1"],
+        "directory": "",
+        "overwrite": False,
+        "message": "chore: upload",
+        "files": [upload_file_payload("a.txt")],
+    }
+    request.update(payload)
+
+    response = client.post("/api/operations/uploads", json=request)
+
+    assert 400 <= response.status_code < 500
+    assert adapter.upload_calls == []
+
+
+def test_upload_rejects_more_than_twenty_files(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "message": "chore: upload",
+            "files": [upload_file_payload(f"{number}.txt") for number in range(21)],
+        },
+    )
+
+    assert response.status_code == 413
+    assert adapter.upload_calls == []
+
+
+def test_upload_rejects_single_file_over_ten_mib(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "message": "chore: upload",
+            "files": [upload_file_payload("large.bin", b"\0" * (10 * 1024 * 1024 + 1))],
+        },
+    )
+
+    assert response.status_code == 413
+    assert adapter.upload_calls == []
+
+
+def test_upload_rejects_total_size_over_twenty_five_mib(services):
+    adapter, _, client = services
+    start_session(client)
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "message": "chore: upload",
+            "files": [
+                upload_file_payload(f"large-{number}.bin", b"\0" * (9 * 1024 * 1024))
+                for number in range(3)
+            ],
+        },
+    )
+
+    assert response.status_code == 413
+    assert adapter.upload_calls == []

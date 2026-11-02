@@ -10,7 +10,7 @@ import uvicorn
 from playwright.sync_api import expect, sync_playwright
 
 from readme_batch.app import create_app
-from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadResult
 from readme_batch.platforms.base import ErrorKind, PlatformError
 
 TOKEN = "browser-test-token"
@@ -38,8 +38,12 @@ class BrowserAdapter:
         }
         self.settings_calls = []
         self.label_calls = []
+        self.upload_calls = []
         self.settings_errors = {}
         self.label_errors = {}
+        self.upload_errors = {}
+        self.upload_results = {}
+        self.existing_paths = {}
         self.list_calls = 0
         self.operation_gate = None
 
@@ -83,6 +87,21 @@ class BrowserAdapter:
         errors = self.label_errors.get(repository.full_name, [])
         if errors:
             raise errors.pop(0)
+
+    def upload_files(self, repository, files, overwrite, message, reconcile_before=False):
+        self.upload_calls.append((repository.full_name, files, overwrite, message))
+        if self.operation_gate:
+            self.operation_gate.wait(2)
+        errors = self.upload_errors.get(repository.full_name, [])
+        if errors:
+            raise errors.pop(0)
+        existing = self.existing_paths.get(repository.full_name, set())
+        if not overwrite and any(file.path in existing for file in files):
+            raise PlatformError(ErrorKind.CONFLICT, "同名文件已存在")
+        results = self.upload_results.get(repository.full_name, [])
+        if results:
+            return results.pop(0)
+        return UploadResult(CommitInfo("commit-1", "https://example/commit/1"), False)
 
 
 class BrowserCredentials:
@@ -454,3 +473,131 @@ def test_labels_submission_uses_original_snapshot_while_form_changes(page, site)
 
     expect(page.locator("#labels-operation-items .badge.success")).to_have_count(1)
     assert adapter.label_calls == [("owner/repo-1", ("Java",))]
+
+
+def memory_file(name, content):
+    return {"name": name, "mimeType": "application/octet-stream", "buffer": content}
+
+
+def test_upload_files_to_subdirectory_and_root_with_commit_links(page, site):
+    adapter, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-upload").click()
+    page.locator("#upload-files").set_input_files([
+        memory_file("hello.txt", b"hello"),
+        memory_file("binary.bin", b"\x00\xff"),
+    ])
+    page.locator("#upload-directory").fill("photo/common")
+    page.locator("#upload-message").fill("chore: browser upload")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#upload-submit").click()
+
+    expect(page.locator("#upload-operation-items .commit-link")).to_have_count(1)
+    assert len(adapter.upload_calls) == 1
+    _, files, overwrite, message = adapter.upload_calls[0]
+    assert [(file.path, file.content) for file in files] == [
+        ("photo/common/hello.txt", b"hello"),
+        ("photo/common/binary.bin", b"\x00\xff"),
+    ]
+    assert overwrite is False
+    assert message == "chore: browser upload"
+
+    page.locator("#upload-files").set_input_files(memory_file("root.txt", b"root"))
+    page.locator("#upload-directory").fill("")
+    page.locator("#upload-submit").click()
+    expect(page.locator("#upload-operation-items .commit-link")).to_have_count(1)
+    assert adapter.upload_calls[-1][1][0].path == "root.txt"
+
+
+def test_upload_conflict_and_overwrite_confirmation(page, site):
+    adapter, base_url = site
+    adapter.existing_paths["owner/repo-1"] = {"photo/common/a.txt"}
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-upload").click()
+    page.locator("#upload-files").set_input_files(memory_file("a.txt", b"new"))
+    page.locator("#upload-directory").fill("photo/common")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#upload-submit").click()
+
+    expect(page.locator("#upload-operation-items .badge.conflict")).to_have_count(1)
+    expect(page.locator("#upload-operation-items .operation-retry")).to_have_count(0)
+
+    page.locator("#upload-overwrite").check()
+    dialogs = []
+    page.on("dialog", lambda dialog: (dialogs.append(dialog.message), dialog.accept()))
+    page.locator("#upload-submit").click()
+
+    expect(page.locator("#upload-operation-items .badge.success")).to_have_count(1)
+    assert any("覆盖同名文件" in message for message in dialogs)
+    assert adapter.upload_calls[-1][2] is True
+
+
+def test_upload_retry_shows_reconciled_success(page, site):
+    adapter, base_url = site
+    adapter.upload_errors["owner/repo-4"] = [
+        PlatformError(ErrorKind.TEMPORARY, "temporary")
+    ] * 3
+    adapter.upload_results["owner/repo-4"] = [UploadResult(None, reconciled=True)]
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-4")
+    page.locator("#tab-upload").click()
+    page.locator("#upload-files").set_input_files(memory_file("a.txt", b"new"))
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#upload-submit").click()
+
+    expect(page.locator("#upload-operation-items .operation-retry")).to_have_count(1)
+    page.locator("#upload-operation-items .operation-retry").click()
+
+    expect(page.locator("#upload-operation-items .reconciled")).to_have_text("核对成功")
+    assert len(adapter.upload_calls) == 4
+
+
+def test_upload_submission_uses_original_file_and_form_snapshot(page, site):
+    adapter, base_url = site
+    adapter.operation_gate = threading.Event()
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-upload").click()
+    page.locator("#upload-files").set_input_files(memory_file("original.bin", b"\x00\xff"))
+    page.locator("#upload-directory").fill("photo/original")
+    page.locator("#upload-message").fill("chore: original")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#upload-submit").click()
+    deadline = time.monotonic() + 3
+    while not adapter.upload_calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(adapter.upload_calls) == 1
+
+    page.locator("#upload-files").set_input_files(memory_file("changed.txt", b"changed"))
+    page.locator("#upload-directory").fill("changed")
+    page.locator("#upload-message").fill("chore: changed")
+    adapter.operation_gate.set()
+
+    expect(page.locator("#upload-operation-items .badge.success")).to_have_count(1)
+    _, files, overwrite, message = adapter.upload_calls[0]
+    assert [(file.path, file.content) for file in files] == [
+        ("photo/original/original.bin", b"\x00\xff")
+    ]
+    assert overwrite is False
+    assert message == "chore: original"
+
+
+def test_upload_tab_preserves_files_and_renames_are_text(page, site):
+    _, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-upload").click()
+    page.locator("#upload-files").set_input_files(memory_file(XSS_TEXT, b"safe"))
+
+    expect(page.locator("#upload-file-list")).to_contain_text(XSS_TEXT)
+    page.locator("#tab-readme").click()
+    page.locator("#tab-upload").click()
+    assert page.locator("#upload-files").evaluate("input => input.files.length") == 1
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#upload-submit").click()
+
+    expect(page.locator("#upload-operation-items .badge.success")).to_have_count(1)
+    expect(page.locator("img")).to_have_count(0)
+    assert page.evaluate("window.__readmeXss") is None

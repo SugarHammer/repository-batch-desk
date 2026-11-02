@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Protocol
 
-from readme_batch.models import CommitInfo, FileSnapshot, Repository
+from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadFile, UploadResult
 
 
 class ErrorKind(Enum):
@@ -46,3 +46,12 @@ class RepositoryPlatform(Protocol):
         repository: Repository,
         labels: tuple[str, ...],
     ) -> None: ...
+
+    def upload_files(
+        self,
+        repository: Repository,
+        files: tuple[UploadFile, ...],
+        overwrite: bool,
+        message: str,
+        reconcile_before: bool = False,
+    ) -> UploadResult: ...

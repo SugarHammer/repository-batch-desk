@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from readme_batch.models import Repository
+from readme_batch.models import CommitInfo, Repository, UploadFile, UploadResult
 from readme_batch.operations import (
     OperationItemState,
     OperationManager,
@@ -25,12 +25,17 @@ def repository(number: int) -> Repository:
 
 
 class FakeAdapter:
-    def __init__(self, settings_errors=None, label_errors=None, gate=None):
+    def __init__(self, settings_errors=None, label_errors=None, upload_errors=None, gate=None):
         self.settings_errors = settings_errors or {}
         self.label_errors = label_errors or {}
+        self.upload_errors = upload_errors or {}
         self.gate = gate
         self.settings_calls = []
         self.label_calls = []
+        self.upload_calls = []
+        self.commit_calls = []
+        self.upload_results = {}
+        self.upload_reconcile_flags = []
 
     def update_repository_settings(self, repo, display_name, private):
         self.settings_calls.append((repo.full_name, display_name, private))
@@ -47,6 +52,23 @@ class FakeAdapter:
         errors = self.label_errors.get(repo.full_name, [])
         if errors:
             raise errors.pop(0)
+
+    def upload_files(self, repo, files, overwrite, message, reconcile_before=False):
+        self.upload_calls.append((repo.full_name, files, overwrite, message))
+        self.upload_reconcile_flags.append(reconcile_before)
+        if self.gate:
+            self.gate.wait(2)
+        errors = self.upload_errors.get(repo.full_name, [])
+        if errors:
+            raise errors.pop(0)
+        results = self.upload_results.get(repo.full_name, [])
+        if results:
+            return results.pop(0)
+        self.commit_calls.append(repo.full_name)
+        return UploadResult(
+            CommitInfo("commit-1", f"https://example/{repo.full_name}/commit/1"),
+            reconciled=False,
+        )
 
 
 def wait_for_state(manager, operation_id, state, timeout=3):
@@ -159,3 +181,98 @@ def test_auth_failure_stops_queued_operations():
     assert adapter.label_calls == [("owner/repo-1", ("Java",))]
     assert all(item.state is OperationItemState.FAILED for item in operation.items)
     assert all(item.error for item in operation.items)
+
+
+def test_upload_task_uses_immutable_file_and_parameter_snapshot():
+    gate = threading.Event()
+    adapter = FakeAdapter(gate=gate)
+    manager = OperationManager(adapter, max_workers=1)
+    files = [UploadFile("photo/a.bin", b"\x00\xff")]
+
+    operation_id = manager.start_upload([repository(1)], files, False, "chore: original")
+    files[0] = UploadFile("photo/changed.bin", b"changed")
+    gate.set()
+    operation = wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    assert adapter.upload_calls == [
+        ("owner/repo-1", (UploadFile("photo/a.bin", b"\x00\xff"),), False, "chore: original")
+    ]
+    assert operation.items[0].commit_info.url == "https://example/owner/repo-1/commit/1"
+    assert operation.items[0].reconciled is False
+
+
+def test_upload_conflict_is_terminal_and_does_not_block_other_repositories():
+    adapter = FakeAdapter(
+        upload_errors={"owner/repo-1": [PlatformError(ErrorKind.CONFLICT, "同名文件已存在")]}
+    )
+    manager = OperationManager(adapter, max_workers=1)
+
+    operation_id = manager.start_upload(
+        [repository(1), repository(2)],
+        [UploadFile("photo/a.bin", b"new")],
+        False,
+        "chore: upload",
+    )
+    operation = wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    assert [item.state for item in operation.items] == [
+        OperationItemState.CONFLICT,
+        OperationItemState.SUCCESS,
+    ]
+    with pytest.raises(StaleOperationError, match="cannot be retried"):
+        manager.start_retry(operation_id, "owner/repo-1")
+
+
+def test_upload_retry_records_reconciliation_without_another_commit():
+    adapter = FakeAdapter(
+        upload_errors={"owner/repo-2": [PlatformError(ErrorKind.TEMPORARY, "temporary")]}
+    )
+    adapter.upload_results["owner/repo-2"] = [UploadResult(None, reconciled=True)]
+    manager = OperationManager(adapter, max_workers=1, max_attempts=1, sleeper=lambda _: None)
+    files = [UploadFile("photo/a.bin", b"new")]
+    operation_id = manager.start_upload([repository(1), repository(2)], files, False, "chore")
+    wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    manager.start_retry(operation_id, "owner/repo-2")
+    operation = wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    assert all(item.state is OperationItemState.SUCCESS for item in operation.items)
+    assert operation.items[1].reconciled is True
+    assert operation.items[1].commit_info is None
+    assert adapter.commit_calls == ["owner/repo-1"]
+    assert adapter.upload_reconcile_flags == [False, False, True]
+
+
+def test_completed_upload_without_retry_releases_file_snapshot():
+    adapter = FakeAdapter()
+    manager = OperationManager(adapter, max_workers=1)
+
+    operation_id = manager.start_upload(
+        [repository(1)], [UploadFile("photo/a.bin", b"content")], False, "chore"
+    )
+    wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    assert manager._uploads == {}
+
+
+def test_retryable_upload_snapshots_have_bounded_retention():
+    adapter = FakeAdapter(
+        upload_errors={
+            "owner/repo-1": [PlatformError(ErrorKind.TEMPORARY, "temporary")] * 5
+        }
+    )
+    manager = OperationManager(adapter, max_workers=1, max_attempts=1, max_retained_uploads=4)
+    operation_ids = []
+
+    for _ in range(5):
+        operation_id = manager.start_upload(
+            [repository(1)], [UploadFile("photo/a.bin", b"content")], False, "chore"
+        )
+        operation_ids.append(operation_id)
+        wait_for_state(manager, operation_id, OperationState.COMPLETE)
+
+    assert len(manager._uploads) == 4
+    assert manager.get_operation(operation_ids[0]).items[0].retryable is False
+    assert manager.get_operation(operation_ids[-1]).items[0].retryable is True
+    with pytest.raises(StaleOperationError, match="cannot be retried"):
+        manager.start_retry(operation_ids[0], "owner/repo-1")

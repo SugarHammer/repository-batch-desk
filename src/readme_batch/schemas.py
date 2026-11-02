@@ -28,3 +28,16 @@ class SettingsOperationRequest(BaseModel):
 class LabelsOperationRequest(BaseModel):
     selected: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
+
+
+class UploadFileRequest(BaseModel):
+    name: str
+    content_base64: str
+
+
+class UploadOperationRequest(BaseModel):
+    selected: list[str] = Field(default_factory=list)
+    directory: str = ""
+    overwrite: bool = False
+    message: str = "chore: 批量上传文件"
+    files: list[UploadFileRequest] = Field(default_factory=list)

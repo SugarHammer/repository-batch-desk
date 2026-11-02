@@ -32,7 +32,7 @@ def test_executor_limits_concurrency_and_completes_each_repository_once():
     max_active = 0
     succeeded = []
 
-    def operation(repo):
+    def operation(repo, attempt):
         nonlocal active, max_active
         with lock:
             active += 1
@@ -64,7 +64,7 @@ def test_temporary_error_uses_backoff_and_is_retryable():
     sleeps = []
     failures = []
 
-    def operation(repo):
+    def operation(repo, attempt):
         attempts.append(repo.full_name)
         raise PlatformError(ErrorKind.TEMPORARY, "temporary")
 
@@ -87,7 +87,7 @@ def test_rate_limit_retry_after_overrides_backoff():
     sleeps = []
     failures = []
 
-    def operation(repo):
+    def operation(repo, attempt):
         raise PlatformError(ErrorKind.RATE_LIMIT, "limited", retry_after=1.5)
 
     executor = RepositoryExecutor(max_workers=1, max_attempts=2, sleeper=sleeps.append)
@@ -108,7 +108,7 @@ def test_auth_failure_stops_queued_operations():
     starts = []
     failures = []
 
-    def operation(repo):
+    def operation(repo, attempt):
         calls.append(repo.full_name)
         raise PlatformError(ErrorKind.AUTH, "unauthorized")
 
@@ -131,7 +131,7 @@ def test_auth_failure_stops_queued_operations():
 def test_unexpected_error_is_safely_mapped():
     failures = []
 
-    def operation(repo):
+    def operation(repo, attempt):
         raise RuntimeError("sensitive implementation detail")
 
     executor = RepositoryExecutor(max_workers=1)

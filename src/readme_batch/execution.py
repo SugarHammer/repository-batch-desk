@@ -26,7 +26,7 @@ class RepositoryExecutor:
     def submit(
         self,
         repositories: list[Repository],
-        operation: Callable[[Repository], T],
+        operation: Callable[[Repository, int], T],
         on_success: Callable[[Repository, T], None],
         on_failure: Callable[[Repository, PlatformError, bool], None],
         on_start: Callable[[Repository], None] | None = None,
@@ -44,7 +44,7 @@ class RepositoryExecutor:
     def _run(
         self,
         repository: Repository,
-        operation: Callable[[Repository], T],
+        operation: Callable[[Repository, int], T],
         on_success: Callable[[Repository, T], None],
         on_failure: Callable[[Repository, PlatformError, bool], None],
         on_start: Callable[[Repository], None] | None,
@@ -60,7 +60,7 @@ class RepositoryExecutor:
             on_start(repository)
         for attempt in range(self._max_attempts):
             try:
-                result = operation(repository)
+                result = operation(repository, attempt)
                 on_success(repository, result)
                 return
             except PlatformError as error:

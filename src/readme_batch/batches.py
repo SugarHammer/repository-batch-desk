@@ -163,7 +163,7 @@ class BatchManager:
 
         self._executor.submit(
             repositories,
-            lambda repo: self._read_preview(repo, old, new),
+            lambda repo, attempt: self._read_preview(repo, old, new),
             lambda repo, preview: self._finish_preview(batch_id, repo.full_name, **preview),
             failed,
         )
@@ -219,7 +219,7 @@ class BatchManager:
 
         self._executor.submit(
             repositories,
-            lambda repo: self._update_readme(batch_id, repo),
+            lambda repo, attempt: self._update_readme(batch_id, repo),
             succeeded,
             failed,
         )
