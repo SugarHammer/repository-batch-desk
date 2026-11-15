@@ -16,6 +16,7 @@ class JsonReportStore:
         temporary = self._directory / f".{batch.id}.{uuid.uuid4().hex}.tmp"
         payload = {
             "id": batch.id,
+            "platform": batch.items[0].repository.platform.value,
             "created_at": batch.created_at.isoformat(),
             "state": batch.state.value,
             "commit_message": batch.commit_message,
@@ -49,6 +50,7 @@ class JsonReportStore:
         temporary = self._directory / f".{operation.id}.{uuid.uuid4().hex}.tmp"
         payload = {
             "id": operation.id,
+            "platform": operation.items[0].repository.platform.value,
             "kind": operation.kind.value,
             "created_at": operation.created_at.isoformat(),
             "state": operation.state.value,

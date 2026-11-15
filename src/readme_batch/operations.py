@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from readme_batch.execution import RepositoryExecutor
-from readme_batch.models import CommitInfo, Repository, UploadFile, UploadResult
+from readme_batch.models import (
+    CommitInfo,
+    DeleteResult,
+    RemoteFile,
+    Repository,
+    UploadFile,
+    UploadResult,
+)
 from readme_batch.platforms.base import ErrorKind, PlatformError, RepositoryPlatform
 
 
@@ -15,6 +22,7 @@ class OperationKind(str, Enum):
     SETTINGS = "settings"
     LABELS = "labels"
     UPLOAD = "upload"
+    DELETE = "delete"
 
 
 class OperationState(str, Enum):
@@ -69,22 +77,24 @@ class OperationManager:
         self._on_complete = on_complete
         self._lock = threading.Lock()
         self._operations: dict[str, Operation] = {}
-        self._settings: dict[str, dict[str, tuple[str, bool | None]]] = {}
+        self._settings: dict[str, dict[str, tuple[str | None, bool | None]]] = {}
         self._labels: dict[str, tuple[str, ...]] = {}
         self._uploads: dict[str, tuple[tuple[UploadFile, ...], bool, str]] = {}
+        self._deletions: dict[str, tuple[dict[str, RemoteFile], str]] = {}
         self._max_retained_uploads = max_retained_uploads
         self._revision = 0
+        self._accepting = True
 
     def start_settings(
         self,
         repositories: list[Repository],
-        names: dict[str, str],
+        names: dict[str, str | None],
         visibility: str,
     ) -> str:
         private = None if visibility == "keep" else visibility == "private"
         settings = {
             repo.full_name: (
-                names.get(repo.full_name, repo.display_name or repo.name).strip(),
+                names[repo.full_name].strip() if names.get(repo.full_name) is not None else None,
                 private,
             )
             for repo in repositories
@@ -114,6 +124,18 @@ class OperationManager:
         self._submit(operation_id, repositories)
         return operation_id
 
+    def start_delete(
+        self,
+        repositories: list[Repository],
+        snapshots: dict[str, RemoteFile],
+        message: str,
+    ) -> str:
+        snapshot = dict(snapshots)
+        operation_id = self._create(OperationKind.DELETE, repositories)
+        self._deletions[operation_id] = (snapshot, message)
+        self._submit(operation_id, repositories)
+        return operation_id
+
     def get_operation(self, operation_id: str) -> Operation:
         with self._lock:
             return self._operations[operation_id]
@@ -139,10 +161,13 @@ class OperationManager:
     def invalidate(self) -> None:
         with self._lock:
             self._revision += 1
+            self._accepting = False
 
     def _create(self, kind: OperationKind, repositories: list[Repository]) -> str:
         operation_id = uuid.uuid4().hex
         with self._lock:
+            if not self._accepting:
+                raise StaleOperationError("operation manager is stale")
             self._operations[operation_id] = Operation(
                 id=operation_id,
                 kind=kind,
@@ -169,7 +194,7 @@ class OperationManager:
                 require_pending=True,
             )
 
-        def succeeded(repo: Repository, result: UploadResult | None) -> None:
+        def succeeded(repo: Repository, result: UploadResult | DeleteResult | None) -> None:
             self._finish_item(
                 operation_id,
                 repo.full_name,
@@ -194,15 +219,18 @@ class OperationManager:
                 retryable=retryable,
             )
 
-        self._executor.submit(
-            repositories,
-            lambda repo, attempt: self._perform(
-                operation_id, repo, attempt, reconcile_before
-            ),
-            succeeded,
-            failed,
-            on_start=started,
-        )
+        with self._lock:
+            if not self._accepting:
+                raise StaleOperationError("operation manager is stale")
+            self._executor.submit(
+                repositories,
+                lambda repo, attempt: self._perform(
+                    operation_id, repo, attempt, reconcile_before
+                ),
+                succeeded,
+                failed,
+                on_start=started,
+            )
 
     def _perform(
         self,
@@ -210,19 +238,27 @@ class OperationManager:
         repo: Repository,
         attempt: int,
         reconcile_before: bool,
-    ) -> UploadResult | None:
+    ) -> UploadResult | DeleteResult | None:
         operation = self.get_operation(operation_id)
         if operation.kind is OperationKind.SETTINGS:
             display_name, private = self._settings[operation_id][repo.full_name]
             self._adapter.update_repository_settings(repo, display_name, private)
         elif operation.kind is OperationKind.LABELS:
-            self._adapter.add_project_labels(repo, self._labels[operation_id])
-        else:
+            self._adapter.add_repository_topics(repo, self._labels[operation_id])
+        elif operation.kind is OperationKind.UPLOAD:
             files, overwrite, message = self._uploads[operation_id]
             return self._adapter.upload_files(
                 repo,
                 files,
                 overwrite,
+                message,
+                reconcile_before=reconcile_before or attempt > 0,
+            )
+        else:
+            snapshots, message = self._deletions[operation_id]
+            return self._adapter.delete_file(
+                repo,
+                snapshots[repo.full_name],
                 message,
                 reconcile_before=reconcile_before or attempt > 0,
             )

@@ -3,6 +3,7 @@ import socket
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
@@ -10,19 +11,40 @@ import uvicorn
 from playwright.sync_api import expect, sync_playwright
 
 from readme_batch.app import create_app
-from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadResult
-from readme_batch.platforms.base import ErrorKind, PlatformError
+from readme_batch.models import (
+    CommitInfo,
+    DeleteResult,
+    FileSnapshot,
+    PlatformKind,
+    RemoteFile,
+    Repository,
+    UploadResult,
+)
+from readme_batch.platforms.base import (
+    GITEE_CAPABILITIES,
+    GITCODE_CAPABILITIES,
+    GITHUB_CAPABILITIES,
+    ErrorKind,
+    PlatformError,
+)
+from readme_batch.platforms.github import GitHubClient
 
 TOKEN = "browser-test-token"
 XSS_TEXT = "<img src=x onerror=window.__readmeXss=true>"
 
 
 class BrowserAdapter:
-    def __init__(self):
+    def __init__(self, capabilities=GITEE_CAPABILITIES, platform=PlatformKind.GITEE):
+        self.capabilities = capabilities
         self.repos = [
             Repository(
                 "owner", f"repo-{n}", f"owner/repo-{n}", "main", f"https://example/{n}",
-                display_name=f"Repo {n}", private=n % 2 == 1,
+                display_name=f"Repo {n}", private=n % 2 == 1, platform=platform,
+                description=(
+                    "第一个仓库简介" if n == 1
+                    else XSS_TEXT if n == 3
+                    else ""
+                ),
             )
             for n in range(1, 5)
         ]
@@ -44,6 +66,11 @@ class BrowserAdapter:
         self.upload_errors = {}
         self.upload_results = {}
         self.existing_paths = {}
+        self.file_outcomes = {}
+        self.read_file_calls = []
+        self.delete_calls = []
+        self.delete_errors = {}
+        self.delete_results = {}
         self.list_calls = 0
         self.operation_gate = None
 
@@ -72,7 +99,7 @@ class BrowserAdapter:
         self.repos = [
             replace(
                 repo,
-                display_name=display_name,
+                display_name=repo.display_name if display_name is None else display_name,
                 private=repo.private if private is None else private,
             )
             if repo.full_name == repository.full_name
@@ -80,7 +107,11 @@ class BrowserAdapter:
             for repo in self.repos
         ]
 
-    def add_project_labels(self, repository, labels):
+    def validate_topics(self, labels):
+        if self.capabilities == GITHUB_CAPABILITIES:
+            GitHubClient.validate_topics(self, labels)
+
+    def add_repository_topics(self, repository, labels):
         self.label_calls.append((repository.full_name, labels))
         if self.operation_gate:
             self.operation_gate.wait(2)
@@ -103,19 +134,54 @@ class BrowserAdapter:
             return results.pop(0)
         return UploadResult(CommitInfo("commit-1", "https://example/commit/1"), False)
 
+    def read_file(self, repository, path):
+        self.read_file_calls.append((repository.full_name, path))
+        outcome = self.file_outcomes.get(
+            repository.full_name, RemoteFile(path, repository.default_branch, f"sha-{repository.name}")
+        )
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def delete_file(self, repository, snapshot, message, reconcile_before=False):
+        self.delete_calls.append((repository.full_name, snapshot, message, reconcile_before))
+        errors = self.delete_errors.get(repository.full_name, [])
+        if errors:
+            raise errors.pop(0)
+        results = self.delete_results.get(repository.full_name, [])
+        if results:
+            return results.pop(0)
+        return DeleteResult(CommitInfo("commit-1", "https://example/commit/1"), False)
+
 
 class BrowserCredentials:
     def __init__(self):
         self.saved = TOKEN
+        self.tokens = {}
+        self.last_platform = PlatformKind.GITEE
 
-    def load(self):
-        return self.saved
+    def load(self, platform):
+        if platform is PlatformKind.GITEE:
+            return self.saved
+        return self.tokens.get(platform)
 
-    def save(self, token):
-        self.saved = token
+    def save(self, platform, token):
+        if platform is PlatformKind.GITEE:
+            self.saved = token
+        else:
+            self.tokens[platform] = token
 
-    def clear(self):
-        self.saved = None
+    def clear(self, platform):
+        if platform is PlatformKind.GITEE:
+            self.saved = None
+        else:
+            self.tokens.pop(platform, None)
+
+    def load_last_platform(self):
+        return self.last_platform
+
+    def save_last_platform(self, platform):
+        self.last_platform = platform
 
 
 @pytest.fixture
@@ -128,19 +194,14 @@ def browser():
         instance.close()
 
 
-@pytest.fixture
-def site(tmp_path):
-    adapter = BrowserAdapter()
-    app = create_app(
-        client_factory=lambda token: adapter,
-        credential_store=BrowserCredentials(),
-        report_directory=tmp_path,
-    )
+@contextmanager
+def serve(app):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
+    app.state.server = server
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     base_url = f"http://127.0.0.1:{port}"
@@ -153,9 +214,41 @@ def site(tmp_path):
             time.sleep(0.05)
     else:
         raise RuntimeError("test server did not start")
-    yield adapter, base_url
-    server.should_exit = True
-    thread.join(timeout=5)
+    try:
+        yield base_url
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def site(tmp_path):
+    adapter = BrowserAdapter()
+    app = create_app(
+        client_factories={PlatformKind.GITEE: lambda token: adapter},
+        credential_store=BrowserCredentials(),
+        report_directory=tmp_path,
+    )
+    with serve(app) as base_url:
+        yield adapter, base_url
+
+
+@pytest.fixture
+def platform_site(tmp_path):
+    adapters = {
+        PlatformKind.GITEE: BrowserAdapter(),
+        PlatformKind.GITHUB: BrowserAdapter(GITHUB_CAPABILITIES, PlatformKind.GITHUB),
+        PlatformKind.GITCODE: BrowserAdapter(GITCODE_CAPABILITIES, PlatformKind.GITCODE),
+    }
+    credentials = BrowserCredentials()
+    credentials.saved = None
+    app = create_app(
+        client_factories={platform: lambda token, adapter=adapter: adapter for platform, adapter in adapters.items()},
+        credential_store=credentials,
+        report_directory=tmp_path,
+    )
+    with serve(app) as base_url:
+        yield adapters, base_url
 
 
 @pytest.fixture
@@ -282,8 +375,8 @@ def test_saved_session_loads_repositories_when_page_opens(page, site):
 
     page.goto(base_url)
 
+    expect(page.locator("#connection-status")).to_contain_text("已恢复保存的会话", timeout=7000)
     expect(page.locator(".repository-row")).to_have_count(4)
-    expect(page.locator("#connection-status")).to_contain_text("已恢复保存的会话")
 
 
 def test_settings_preview_commit_and_repository_refresh(page, site):
@@ -631,3 +724,279 @@ def test_select_all_toggles_between_select_and_clear_current_filter(page, site):
     page.locator("#select-all-repositories").click()
     expect(page.locator(".repository-row input:checked")).to_have_count(0)
     expect(page.locator("#select-all-repositories")).to_have_text("全选")
+
+
+def test_exit_button_stops_local_server(page, site):
+    _, base_url = site
+    page.goto(base_url)
+    page.on("dialog", lambda dialog: dialog.accept())
+
+    page.locator("#exit-app").click()
+
+    expect(page.locator("#exit-status")).to_have_text("工具已退出，可以关闭此页面")
+
+
+def connect_platform(page, base_url, platform):
+    page.goto(base_url)
+    page.locator("#platform").select_option(platform)
+    page.locator("#token").fill(TOKEN)
+    page.locator("#connect").click()
+    expect(page.locator(".repository-row")).to_have_count(4)
+
+
+def test_github_connection_uses_platform_copy_and_adapter(page, platform_site):
+    adapters, base_url = platform_site
+
+    connect_platform(page, base_url, "github")
+
+    expect(page.locator("#connection-title")).to_have_text("连接 GitHub")
+    expect(page.locator("#platform")).to_have_value("github")
+    expect(page.locator("footer")).to_contain_text("GitHub")
+    expect(page.locator("footer")).not_to_contain_text("Gitee")
+    assert adapters[PlatformKind.GITHUB].list_calls == 1
+    assert adapters[PlatformKind.GITEE].list_calls == 0
+
+
+def test_github_settings_omit_display_name_and_upload_remains_available(page, platform_site):
+    adapters, base_url = platform_site
+    adapter = adapters[PlatformKind.GITHUB]
+    connect_platform(page, base_url, "github")
+    select_repo(page, "owner/repo-2")
+    page.locator("#tab-settings").click()
+
+    expect(page.locator(".setting-name")).to_have_count(0)
+    page.locator("#visibility").select_option("private")
+    page.locator("#settings-preview").click()
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#settings-submit").click()
+    expect(page.locator("#settings-operation-items .badge.success")).to_have_count(1)
+    assert adapter.settings_calls == [("owner/repo-2", None, True)]
+
+    page.locator("#tab-upload").click()
+    expect(page.locator("#upload-submit")).to_be_enabled()
+    page.locator("#upload-files").set_input_files(memory_file("hello.txt", b"hello"))
+    page.locator("#upload-submit").click()
+    expect(page.locator("#upload-operation-items .commit-link")).to_have_count(1)
+    assert len(adapter.upload_calls) == 1
+
+
+def test_github_topics_rules_are_visible_and_enforced(page, platform_site):
+    adapters, base_url = platform_site
+    adapter = adapters[PlatformKind.GITHUB]
+    connect_platform(page, base_url, "github")
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-labels").click()
+
+    expect(page.locator("#labels-title")).to_contain_text("Repository Topics")
+    expect(page.locator("#labels-hint")).to_contain_text("小写字母、数字和连字符")
+    page.locator("#labels-input").fill("Bad Label")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#labels-submit").click()
+
+    expect(page.locator("#labels-summary")).to_contain_text("Invalid GitHub repository topics")
+    assert adapter.label_calls == []
+
+
+def test_gitcode_upload_is_visibly_disabled(page, platform_site):
+    _, base_url = platform_site
+    connect_platform(page, base_url, "gitcode")
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-upload").click()
+
+    expect(page.locator("#upload-summary")).to_contain_text("当前平台暂不支持多文件单提交")
+    expect(page.locator("#upload-submit")).to_be_disabled()
+
+
+def test_platform_switch_clears_old_repositories_draft_and_preview(page, platform_site):
+    _, base_url = platform_site
+    connect_platform(page, base_url, "gitee")
+    select_repo(page, "owner/repo-1")
+    enter_rules(page)
+    preview(page)
+    page.on("dialog", lambda dialog: dialog.accept())
+
+    page.locator("#platform").select_option("github")
+
+    expect(page.locator(".repository-row")).to_have_count(0)
+    expect(page.locator("#old-text")).to_have_value("")
+    expect(page.locator("#new-text")).to_have_value("")
+    expect(page.locator("#preview-items .preview-item")).to_have_count(0)
+    expect(page.locator("#commit")).to_be_disabled()
+    expect(page.locator("#connection-title")).to_have_text("连接 GitHub")
+
+
+def test_saved_github_session_restores_platform_and_capabilities(page, tmp_path):
+    adapter = BrowserAdapter(GITHUB_CAPABILITIES, PlatformKind.GITHUB)
+    credentials = BrowserCredentials()
+    credentials.saved = None
+    credentials.tokens[PlatformKind.GITHUB] = TOKEN
+    credentials.last_platform = PlatformKind.GITHUB
+    app = create_app(
+        client_factories={PlatformKind.GITHUB: lambda token: adapter},
+        credential_store=credentials,
+        report_directory=tmp_path,
+    )
+    with serve(app) as base_url:
+        page.goto(base_url)
+
+        expect(page.locator("#platform")).to_have_value("github")
+        expect(page.locator("#connection-title")).to_have_text("连接 GitHub")
+        expect(page.locator("#connection-status")).to_contain_text("已恢复保存的会话", timeout=7000)
+        expect(page.locator(".repository-row")).to_have_count(4)
+        page.locator("#tab-settings").click()
+        expect(page.locator(".setting-name")).to_have_count(0)
+        assert TOKEN not in page.locator("body").inner_text()
+
+
+def test_delayed_repository_response_cannot_repopulate_switched_platform(page, platform_site):
+    _, base_url = platform_site
+    connect_platform(page, base_url, "gitee")
+    release = threading.Event()
+
+    def delay_repositories(route):
+        release.wait(2)
+        route.continue_()
+
+    page.route("**/api/repositories", delay_repositories)
+    page.evaluate("void loadRepositories()")
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#platform").select_option("github")
+    release.set()
+
+    expect(page.locator("#connection-title")).to_have_text("连接 GitHub")
+    expect(page.locator(".repository-row")).to_have_count(0)
+    expect(page.locator("#connection-status")).to_contain_text("已切换到 GitHub")
+
+
+def test_settings_show_repository_descriptions_as_text(page, site):
+    _, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    select_repo(page, "owner/repo-2")
+    select_repo(page, "owner/repo-3")
+
+    page.locator("#tab-settings").click()
+
+    expect(page.locator(".setting-description")).to_have_count(3)
+    expect(page.locator(".setting-description").nth(0)).to_have_text("第一个仓库简介")
+    expect(page.locator(".setting-description").nth(1)).to_have_text("暂无简介")
+    expect(page.locator(".setting-description").nth(2)).to_have_text(XSS_TEXT)
+    expect(page.locator("#settings-repositories img")).to_have_count(0)
+    assert page.evaluate("window.__readmeXss") is None
+
+
+def test_delete_file_preview_confirmation_and_commit(page, site):
+    adapter, base_url = site
+    adapter.file_outcomes["owner/repo-2"] = PlatformError(ErrorKind.NOT_FOUND, "missing")
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    select_repo(page, "owner/repo-2")
+    page.locator("#tab-delete").click()
+    page.locator("#delete-path").fill("images/abc.png")
+    page.locator("#delete-message").fill("chore: browser delete")
+
+    page.locator("#delete-preview").click()
+
+    expect(page.locator("#delete-preview-items .deletion-preview-item")).to_have_count(2)
+    expect(page.locator("#delete-preview-items .badge.ready")).to_have_count(1)
+    expect(page.locator("#delete-preview-items .badge.missing")).to_have_count(1)
+    expect(page.locator("#delete-submit")).to_be_enabled()
+    assert adapter.delete_calls == []
+    dialogs = []
+    page.on("dialog", lambda dialog: (dialogs.append(dialog.message), dialog.accept()))
+    page.locator("#delete-submit").click()
+
+    expect(page.locator("#delete-operation-items .badge.success")).to_have_count(1)
+    expect(page.locator("#delete-operation-items .commit-link")).to_have_count(1)
+    expect(page.locator("#delete-preview-items .deletion-preview-item")).to_have_count(0)
+    expect(page.locator("#delete-preview-items .badge.ready")).to_have_count(0)
+    assert adapter.delete_calls == [
+        (
+            "owner/repo-1",
+            RemoteFile("images/abc.png", "main", "sha-repo-1"),
+            "chore: browser delete",
+            False,
+        )
+    ]
+    assert "1 个仓库" in dialogs[0]
+    assert "images/abc.png" in dialogs[0]
+
+
+def test_delete_preview_is_invalidated_by_path_and_selection_changes(page, site):
+    _, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-delete").click()
+    page.locator("#delete-path").fill("abc.png")
+    page.locator("#delete-preview").click()
+    expect(page.locator("#delete-submit")).to_be_enabled()
+
+    page.locator("#delete-path").fill("images/abc.png")
+    expect(page.locator("#delete-submit")).to_be_disabled()
+    page.locator("#delete-preview").click()
+    expect(page.locator("#delete-submit")).to_be_enabled()
+    select_repo(page, "owner/repo-2")
+
+    expect(page.locator("#delete-submit")).to_be_disabled()
+    expect(page.locator("#delete-summary")).to_contain_text("重新检查")
+
+
+def test_delete_operation_retry_shows_reconciled_success(page, site):
+    adapter, base_url = site
+    adapter.delete_errors["owner/repo-4"] = [
+        PlatformError(ErrorKind.TEMPORARY, "temporary")
+    ] * 3
+    adapter.delete_results["owner/repo-4"] = [DeleteResult(None, reconciled=True)]
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-4")
+    page.locator("#tab-delete").click()
+    page.locator("#delete-path").fill("abc.png")
+    page.locator("#delete-preview").click()
+    expect(page.locator("#delete-submit")).to_be_enabled()
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#delete-submit").click()
+
+    expect(page.locator("#delete-operation-items .operation-retry")).to_have_count(1)
+    page.locator("#delete-operation-items .operation-retry").click()
+
+    expect(page.locator("#delete-operation-items .reconciled")).to_have_text("核对成功")
+    assert len(adapter.delete_calls) == 4
+
+
+def test_settings_preview_button_does_not_squeeze_hint_into_a_narrow_column(page, site):
+    _, base_url = site
+    connect_and_load(page, base_url)
+    select_repo(page, "owner/repo-1")
+    page.locator("#tab-settings").click()
+
+    action_row = page.locator(".action-row").filter(has=page.locator("#settings-preview"))
+    row_width = action_row.evaluate("element => element.getBoundingClientRect().width")
+    button_width = page.locator("#settings-preview").evaluate(
+        "element => element.getBoundingClientRect().width"
+    )
+    hint_width = action_row.locator(".hint").evaluate(
+        "element => element.getBoundingClientRect().width"
+    )
+
+    assert button_width < row_width * 0.5
+    assert hint_width > 200
+
+
+@pytest.mark.parametrize("platform", ["github", "gitcode"])
+def test_file_delete_tab_is_hidden_for_unsupported_platforms(page, platform_site, platform):
+    _, base_url = platform_site
+
+    connect_platform(page, base_url, platform)
+
+    expect(page.locator("#tab-delete")).to_be_hidden()
+    assert page.evaluate("document.querySelector('#tab-delete').hidden") is True
+
+
+def test_product_name_covers_repository_batch_management(page, site):
+    _, base_url = site
+
+    page.goto(base_url)
+
+    expect(page).to_have_title("仓库批量管理台")
+    expect(page.locator("h1")).to_have_text("仓库批量管理台")
+    expect(page.locator("footer")).to_contain_text("REPOSITORY BATCH DESK")

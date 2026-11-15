@@ -148,3 +148,24 @@ def test_unexpected_error_is_safely_mapped():
     assert str(error) == "Repository operation failed"
     assert "sensitive implementation detail" not in str(error)
     assert retryable is False
+
+
+
+def test_long_rate_limit_does_not_sleep_worker():
+    sleeps = []
+    failures = []
+
+    def operation(repo, attempt):
+        raise PlatformError(ErrorKind.RATE_LIMIT, "limited", retry_after=61)
+
+    executor = RepositoryExecutor(max_workers=1, max_attempts=3, sleeper=sleeps.append)
+    executor.submit(
+        [repository(1)],
+        operation,
+        lambda repo, result: None,
+        lambda repo, error, retryable: failures.append(retryable),
+    )
+    wait_for(lambda: len(failures) == 1)
+
+    assert sleeps == []
+    assert failures == [True]

@@ -1,16 +1,27 @@
 import base64
 import binascii
+import json
 from urllib.parse import quote
 
 import httpx
 
-from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadFile, UploadResult
-from readme_batch.platforms.base import ErrorKind, PlatformError
+from readme_batch.models import (
+    CommitInfo,
+    DeleteResult,
+    FileSnapshot,
+    RemoteFile,
+    Repository,
+    UploadFile,
+    UploadResult,
+)
+from readme_batch.platforms.base import ErrorKind, GITEE_CAPABILITIES, PlatformError
 
 API_URL = "https://gitee.com/api/v5"
 
 
 class GiteeClient:
+    capabilities = GITEE_CAPABILITIES
+
     def __init__(self, token: str, transport: httpx.BaseTransport | None = None):
         self._token = token
         self._client = httpx.Client(
@@ -46,8 +57,10 @@ class GiteeClient:
                         html_url=item["html_url"],
                         display_name=item["name"],
                         private=item["private"],
+                        description=item.get("description") or "",
                     )
                     for item in items
+                    if item.get("default_branch")
                 )
             except (KeyError, TypeError, ValueError):
                 raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee repository response") from None
@@ -58,15 +71,21 @@ class GiteeClient:
     def update_repository_settings(
         self,
         repository: Repository,
-        display_name: str,
+        display_name: str | None,
         private: bool | None,
     ) -> None:
-        data = {"access_token": self._token, "name": display_name}
+        data = {
+            "access_token": self._token,
+            "name": display_name if display_name is not None else repository.display_name,
+        }
         if private is not None:
             data["private"] = private
         self._request("PATCH", f"/repos/{repository.owner}/{repository.name}", data=data)
 
-    def add_project_labels(self, repository: Repository, labels: tuple[str, ...]) -> None:
+    def validate_topics(self, labels: tuple[str, ...]) -> None:
+        pass
+
+    def add_repository_topics(self, repository: Repository, labels: tuple[str, ...]) -> None:
         self._request(
             "POST",
             f"/repos/{repository.owner}/{repository.name}/project_labels",
@@ -171,6 +190,81 @@ class GiteeClient:
         except (KeyError, TypeError, ValueError):
             raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
 
+    def read_file(self, repository: Repository, path: str) -> RemoteFile:
+        response = self._request(
+            "GET",
+            f"/repos/{repository.owner}/{repository.name}/contents/{quote(path, safe='/')}",
+            params={"access_token": self._token, "ref": repository.default_branch},
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee file response") from None
+        if payload == []:
+            raise PlatformError(ErrorKind.NOT_FOUND, "文件不存在")
+        if not isinstance(payload, dict) or payload.get("type") != "file":
+            if isinstance(payload, (dict, list)):
+                raise PlatformError(ErrorKind.CONFLICT, "目标路径不是普通文件")
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee file response")
+        sha = payload.get("sha")
+        if not isinstance(sha, str) or not sha:
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee file response")
+        return RemoteFile(path=path, branch=repository.default_branch, sha=sha)
+
+    def delete_file(
+        self,
+        repository: Repository,
+        snapshot: RemoteFile,
+        message: str,
+        reconcile_before: bool = False,
+    ) -> DeleteResult:
+        if reconcile_before:
+            reconciled = self._reconcile_delete(repository, snapshot)
+            if reconciled is not None:
+                return reconciled
+        try:
+            response = self._request(
+                "DELETE",
+                f"/repos/{repository.owner}/{repository.name}/contents/"
+                f"{quote(snapshot.path, safe='/')}",
+                params={
+                    "access_token": self._token,
+                    "sha": snapshot.sha,
+                    "message": message,
+                    "branch": snapshot.branch,
+                },
+                bad_request_kind=ErrorKind.CONFLICT,
+            )
+        except PlatformError as error:
+            if error.kind in {
+                ErrorKind.TEMPORARY,
+                ErrorKind.RATE_LIMIT,
+                ErrorKind.CONFLICT,
+            }:
+                reconciled = self._reconcile_delete(repository, snapshot)
+                if reconciled is not None:
+                    return reconciled
+            raise
+        try:
+            commit = response.json()["commit"]
+            url = commit.get("html_url") or f"{repository.html_url}/commit/{commit['sha']}"
+            return DeleteResult(CommitInfo(sha=commit["sha"], url=url), reconciled=False)
+        except (KeyError, TypeError, ValueError):
+            raise PlatformError(ErrorKind.REQUEST, "Invalid Gitee commit response") from None
+
+    def _reconcile_delete(
+        self, repository: Repository, snapshot: RemoteFile
+    ) -> DeleteResult | None:
+        try:
+            current = self.read_file(repository, snapshot.path)
+        except PlatformError as error:
+            if error.kind is ErrorKind.NOT_FOUND:
+                return DeleteResult(commit_info=None, reconciled=True)
+            return None
+        if current.sha != snapshot.sha:
+            raise PlatformError(ErrorKind.CONFLICT, "文件已变化，请重新检查")
+        return None
+
     def _file_exists(self, repository: Repository, path: str) -> bool:
         try:
             response = self._request(
@@ -222,6 +316,26 @@ class GiteeClient:
         except PlatformError:
             return False
 
+    def _error_detail(self, response: httpx.Response) -> str:
+        try:
+            payload = response.json()
+        except ValueError:
+            return ""
+        detail = None
+        if isinstance(payload, dict):
+            for key in ("message", "error", "error_description", "errors"):
+                if payload.get(key):
+                    detail = payload[key]
+                    break
+        elif isinstance(payload, (str, list)):
+            detail = payload
+        if detail is None:
+            return ""
+        if not isinstance(detail, str):
+            detail = json.dumps(detail, ensure_ascii=False)
+        detail = detail.strip().replace(self._token, "[已隐藏]")
+        return detail[:500]
+
     def _request(
         self,
         method: str,
@@ -251,7 +365,11 @@ class GiteeClient:
                 retry_after = float(response.headers["Retry-After"])
             except (KeyError, TypeError, ValueError):
                 pass
-        raise PlatformError(kind, f"Gitee request failed ({response.status_code})", retry_after)
+        message = f"Gitee request failed ({response.status_code})"
+        detail = self._error_detail(response)
+        if detail:
+            message = f"{message}: {detail}"
+        raise PlatformError(kind, message, retry_after)
 
     @staticmethod
     def _readme_path(repository: Repository) -> str:

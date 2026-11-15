@@ -2,10 +2,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from readme_batch.models import PlatformKind
+
 
 class SessionRequest(BaseModel):
     token: str = Field(min_length=1)
     remember: bool = False
+    platform: PlatformKind = PlatformKind.GITEE
 
 
 class DraftRequest(BaseModel):
@@ -41,3 +44,9 @@ class UploadOperationRequest(BaseModel):
     overwrite: bool = False
     message: str = "chore: 批量上传文件"
     files: list[UploadFileRequest] = Field(default_factory=list)
+
+
+class DeletionPreviewRequest(BaseModel):
+    selected: list[str] = Field(default_factory=list)
+    path: str = ""
+    message: str = "chore: 批量删除文件"

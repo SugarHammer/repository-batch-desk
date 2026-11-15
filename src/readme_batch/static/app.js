@@ -1,11 +1,21 @@
 const byId = (id) => document.getElementById(id);
 const selected = new Set();
+const PLATFORM_NAMES = { gitee: "Gitee", github: "GitHub", gitcode: "GitCode" };
+const DEFAULT_CAPABILITIES = {
+  gitee: { display_name: true, visibility: true, repository_topics: true, upload_mode: "single_commit", file_deletion: true },
+  github: { display_name: false, visibility: true, repository_topics: true, upload_mode: "single_commit", file_deletion: false },
+  gitcode: { display_name: true, visibility: true, repository_topics: true, upload_mode: "unsupported", file_deletion: false },
+};
 let repositories = [];
 let batchId = null;
 let batch = null;
 let draftTimer = null;
 let pollTimer = null;
 let apiToken = "";
+let currentPlatform = "gitee";
+let capabilities = DEFAULT_CAPABILITIES.gitee;
+let sessionActive = false;
+let sessionGeneration = 0;
 const tokenReady = fetch("/api/ui-token")
   .then((response) => response.json())
   .then((payload) => { apiToken = payload.token; });
@@ -135,9 +145,17 @@ function draftChanged() {
   }, 150);
 }
 
-async function loadRepositories(preserveSelection = false) {
+async function loadRepositories(preserveSelection = false, generation = sessionGeneration) {
   const previousSelection = new Set(selected);
-  repositories = await api("/api/repositories");
+  let items;
+  try {
+    items = await api("/api/repositories");
+  } catch (error) {
+    if (generation !== sessionGeneration) return false;
+    throw error;
+  }
+  if (generation !== sessionGeneration) return false;
+  repositories = items;
   selected.clear();
   if (preserveSelection) {
     repositories.forEach((repository) => {
@@ -147,18 +165,28 @@ async function loadRepositories(preserveSelection = false) {
   invalidatePreview();
   renderRepositories();
   document.dispatchEvent(new Event("repositories-loaded"));
+  return true;
 }
 
 async function connect() {
+  const generation = ++sessionGeneration;
   byId("connect").disabled = true;
   setConnectionStatus("正在连接并读取仓库…");
   try {
     await api("/api/session", {
       method: "POST",
-      body: JSON.stringify({ token: byId("token").value, remember: byId("remember").checked }),
+      body: JSON.stringify({
+        token: byId("token").value,
+        remember: byId("remember").checked,
+        platform: currentPlatform,
+      }),
     });
+    if (generation !== sessionGeneration) return;
     byId("token").value = "";
-    await loadRepositories();
+    const session = await api("/api/session");
+    if (generation !== sessionGeneration) return;
+    applySession(session);
+    if (!await loadRepositories(false, generation)) return;
     setConnectionStatus(`已加载 ${repositories.length} 个仓库`);
   } catch (error) {
     setConnectionStatus(error.message);
@@ -168,15 +196,18 @@ async function connect() {
 }
 
 async function createPreview() {
+  const generation = sessionGeneration;
   byId("preview").disabled = true;
   byId("commit").disabled = true;
   byId("preview-summary").textContent = "正在读取 README，尚未进行任何提交…";
   try {
     await flushDraft();
     const result = await api("/api/previews", { method: "POST" });
+    if (generation !== sessionGeneration) return;
     batchId = result.id;
     await pollBatch();
   } catch (error) {
+    if (generation !== sessionGeneration) return;
     byId("preview-summary").textContent = error.message;
   } finally {
     byId("preview").disabled = false;
@@ -291,6 +322,90 @@ async function retryItem(fullName) {
   }
 }
 
+function applyPlatformPresentation() {
+  const name = PLATFORM_NAMES[currentPlatform];
+  byId("platform").value = currentPlatform;
+  byId("connection-title").textContent = `连接 ${name}`;
+  byId("token").placeholder = `仅发送至 ${name} 官方接口`;
+  byId("platform-footer").textContent = `所有请求仅在本机与 ${name} 之间传递`;
+  const github = currentPlatform === "github";
+  byId("labels-title").textContent = github ? "追加仓库主题（Repository Topics）" : "追加仓库标签";
+  byId("labels-hint").textContent = github
+    ? "仅支持小写字母、数字和连字符。只追加，不清除已有 Topics。"
+    : "使用中英文逗号分隔，自动去空白和去重。只追加，不清除已有标签。";
+  const unsupported = capabilities.upload_mode !== "single_commit";
+  byId("tab-delete").hidden = !capabilities.file_deletion;
+  if (!capabilities.file_deletion && !byId("view-delete").hidden) selectOperationView("readme");
+  byId("upload-submit").disabled = unsupported;
+  byId("upload-summary").textContent = unsupported
+    ? "当前平台暂不支持多文件单提交"
+    : "每个仓库只产生一次提交";
+  if (typeof renderSettingsRepositories === "function") renderSettingsRepositories();
+}
+
+function applySession(session) {
+  sessionActive = session.active;
+  if (session.active) {
+    currentPlatform = session.platform;
+    capabilities = session.capabilities;
+  } else {
+    capabilities = DEFAULT_CAPABILITIES[currentPlatform];
+  }
+  applyPlatformPresentation();
+}
+
+function resetForPlatformSwitch() {
+  clearTimeout(draftTimer);
+  selected.clear();
+  repositories = [];
+  invalidatePreview();
+  renderRepositories();
+  byId("old-text").value = "";
+  byId("new-text").value = "";
+  byId("commit-message").value = "docs: 批量更新 README";
+  ["settings", "labels", "upload", "delete"].forEach((kind) => {
+    clearTimeout(operationTimers[kind]);
+    operationIds[kind] = null;
+    operations[kind] = null;
+    operationRefreshed[kind] = false;
+    operationPollFailures[kind] = 0;
+    byId(`${kind}-operation-items`).replaceChildren();
+  });
+  settingsChanges = [];
+  byId("settings-change-items").replaceChildren();
+  byId("settings-submit").disabled = true;
+  byId("labels-input").value = "";
+  byId("labels-summary").textContent = "等待输入标签";
+  byId("upload-files").value = "";
+  byId("upload-file-list").replaceChildren();
+  invalidateDeletionPreview();
+}
+
+async function changePlatform() {
+  const next = byId("platform").value;
+  if (next === currentPlatform) return;
+  if (sessionActive && !window.confirm("切换平台将清空当前仓库选择、草稿和预览。确认继续？")) {
+    byId("platform").value = currentPlatform;
+    return;
+  }
+  const generation = ++sessionGeneration;
+  try {
+    if (sessionActive) await api("/api/session", { method: "DELETE" });
+    if (generation !== sessionGeneration) return;
+    currentPlatform = next;
+    sessionActive = false;
+    capabilities = DEFAULT_CAPABILITIES[currentPlatform];
+    resetForPlatformSwitch();
+    applyPlatformPresentation();
+    setConnectionStatus(`已切换到 ${PLATFORM_NAMES[currentPlatform]}，请输入令牌连接`);
+  } catch (error) {
+    if (generation !== sessionGeneration) return;
+    byId("platform").value = currentPlatform;
+    setConnectionStatus(error.message);
+  }
+}
+
+byId("platform").addEventListener("change", changePlatform);
 byId("connect").addEventListener("click", connect);
 byId("preview").addEventListener("click", createPreview);
 byId("commit").addEventListener("click", commitBatch);
@@ -300,10 +415,28 @@ byId("select-all-repositories").addEventListener("click", selectAllFilteredRepos
   byId(id).addEventListener("input", draftChanged);
 });
 
+async function exitApp() {
+  if (!window.confirm("确定退出工具？本地服务将停止，不会影响远端仓库。")) return;
+  try {
+    await api("/api/shutdown", { method: "POST" });
+    document.querySelectorAll("button, input, textarea").forEach((control) => {
+      control.disabled = true;
+    });
+    byId("exit-status").textContent = "工具已退出，可以关闭此页面";
+  } catch (error) {
+    byId("exit-status").textContent = error.message;
+  }
+}
+
+byId("exit-app").addEventListener("click", exitApp);
+
 async function initializeSession() {
+  const generation = sessionGeneration;
   const session = await api("/api/session");
+  if (generation !== sessionGeneration) return;
+  applySession(session);
   if (session.active) {
-    await loadRepositories();
+    if (!await loadRepositories(false, generation)) return;
     setConnectionStatus(`已恢复保存的会话，共 ${repositories.length} 个仓库`);
   }
 }

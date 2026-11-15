@@ -1,6 +1,7 @@
 import base64
 import json
 import threading
+from dataclasses import replace
 from urllib.parse import parse_qs
 
 import httpx
@@ -56,6 +57,19 @@ def test_list_repositories_reads_all_pages():
     assert repos[0].default_branch == "main"
     assert [call.request.url.params["page"] for call in route.calls] == ["1", "2"]
     assert all(call.request.url.params["per_page"] == "100" for call in route.calls)
+
+
+@respx.mock
+def test_list_repositories_skips_empty_repositories_without_default_branch():
+    empty = repo_payload(1)
+    empty["default_branch"] = None
+    respx.get(f"{API}/user/repos").mock(
+        return_value=httpx.Response(200, json=[empty, repo_payload(2)])
+    )
+
+    repos = GiteeClient(TOKEN).list_repositories()
+
+    assert [repo.full_name for repo in repos] == ["owner/repo-2"]
 
 
 @respx.mock
@@ -226,6 +240,16 @@ def test_list_repositories_reads_display_name_and_private():
     assert repos[0].private is True
 
 
+def test_repository_defaults_to_gitee_and_client_declares_capabilities():
+    capabilities = GiteeClient(TOKEN).capabilities
+
+    assert repository().platform.value == "gitee"
+    assert capabilities.display_name is True
+    assert capabilities.visibility is True
+    assert capabilities.repository_topics is True
+    assert capabilities.upload_mode == "single_commit"
+
+
 @respx.mock
 def test_update_repository_settings_sends_name_and_private_without_path():
     route = respx.patch(f"{API}/repos/owner/repo-1").mock(
@@ -245,8 +269,9 @@ def test_visibility_only_update_sends_current_display_name():
     route = respx.patch(f"{API}/repos/owner/repo-1").mock(
         return_value=httpx.Response(200, json={})
     )
+    repo = replace(repository(), display_name="显示名称")
 
-    GiteeClient(TOKEN).update_repository_settings(repository(), "显示名称", True)
+    GiteeClient(TOKEN).update_repository_settings(repo, None, True)
 
     form = parse_qs(route.calls[0].request.content.decode("utf-8"))
     assert form["name"] == ["显示名称"]
@@ -254,12 +279,12 @@ def test_visibility_only_update_sends_current_display_name():
 
 
 @respx.mock
-def test_add_project_labels_posts_json_array():
+def test_add_repository_topics_posts_json_array():
     route = respx.post(f"{API}/repos/owner/repo-1/project_labels").mock(
         return_value=httpx.Response(200, json=[])
     )
 
-    GiteeClient(TOKEN).add_project_labels(repository(), ("Java", "Spring Boot"))
+    GiteeClient(TOKEN).add_repository_topics(repository(), ("Java", "Spring Boot"))
 
     assert json.loads(route.calls[0].request.content) == ["Java", "Spring Boot"]
 
@@ -535,3 +560,21 @@ def test_upload_directory_path_is_rejected_as_not_a_file():
     assert caught.value.kind is ErrorKind.CONFLICT
     assert str(caught.value) == "目标路径不是普通文件"
     assert not commit_route.called
+
+
+from platform_contract import RepositoryPlatformContract
+
+
+class TestGiteeContract(RepositoryPlatformContract):
+    API = API
+    TOKEN = TOKEN
+    PLATFORM = "gitee"
+
+    def _client(self):
+        return GiteeClient(self.TOKEN)
+
+    def _repo_payload(self, number):
+        return repo_payload(number)
+
+    def _repository(self):
+        return repository()

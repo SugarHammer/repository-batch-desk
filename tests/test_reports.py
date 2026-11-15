@@ -51,6 +51,7 @@ def test_report_contains_results_but_no_sensitive_content(tmp_path):
     assert list(tmp_path.iterdir()) == [path]
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["id"] == "batch-123"
+    assert payload["platform"] == "gitee"
     assert payload["created_at"] == "2026-11-01T00:00:00+00:00"
     assert payload["commit_message"] == "docs: update"
     assert payload["items"][0] == {
@@ -95,6 +96,7 @@ def test_operation_report_contains_public_results_without_parameter_snapshot(tmp
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["id"] == "operation-123"
+    assert payload["platform"] == "gitee"
     assert payload["kind"] == "settings"
     assert payload["state"] == "complete"
     assert payload["items"][0] == {

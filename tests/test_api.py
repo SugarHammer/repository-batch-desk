@@ -1,31 +1,45 @@
 import base64
 import time
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from readme_batch.app import create_app
-from readme_batch.models import CommitInfo, FileSnapshot, Repository, UploadResult
-from readme_batch.platforms.base import ErrorKind, PlatformError
+from readme_batch.models import CommitInfo, FileSnapshot, PlatformKind, Repository, UploadResult
+from readme_batch.platforms.base import (
+    GITEE_CAPABILITIES,
+    GITHUB_CAPABILITIES,
+    ErrorKind,
+    PlatformError,
+)
 
 TOKEN = "test-api-token"
 
 
 class FakeAdapter:
-    def __init__(self):
+    def __init__(self, capabilities=GITEE_CAPABILITIES):
+        self.capabilities = capabilities
+        platform = PlatformKind.GITEE
+        if not capabilities.display_name:
+            platform = PlatformKind.GITHUB
+        elif capabilities.upload_mode == "unsupported":
+            platform = PlatformKind.GITCODE
         self.repos = [
             Repository(
                 "owner", "repo-1", "owner/repo-1", "main", "https://example/1",
-                display_name="Repo One", private=True,
+                display_name="Repo One", private=True, platform=platform,
+                description="第一个仓库简介",
             ),
             Repository(
                 "owner", "repo-2", "owner/repo-2", "main", "https://example/2",
-                display_name="Repo Two", private=False,
+                display_name="Repo Two", private=False, platform=platform,
             ),
         ]
         self.updates = []
         self.settings_calls = []
         self.label_calls = []
+        self.validated_topics = []
         self.upload_calls = []
         self.settings_errors = {}
         self.label_errors = {}
@@ -47,7 +61,10 @@ class FakeAdapter:
         if errors:
             raise errors.pop(0)
 
-    def add_project_labels(self, repository, labels):
+    def validate_topics(self, labels):
+        self.validated_topics.append(labels)
+
+    def add_repository_topics(self, repository, labels):
         self.label_calls.append((repository.full_name, labels))
         errors = self.label_errors.get(repository.full_name, [])
         if errors:
@@ -61,17 +78,33 @@ class FakeAdapter:
 class FakeCredentials:
     def __init__(self):
         self.saved = None
+        self.tokens = {}
+        self.last_platform = PlatformKind.GITEE
         self.cleared = False
 
-    def save(self, token):
-        self.saved = token
+    def save(self, platform, token):
+        if platform is PlatformKind.GITEE:
+            self.saved = token
+        else:
+            self.tokens[platform] = token
 
-    def load(self):
-        return self.saved
+    def load(self, platform):
+        if platform is PlatformKind.GITEE:
+            return self.saved
+        return self.tokens.get(platform)
 
-    def clear(self):
-        self.saved = None
+    def clear(self, platform):
+        if platform is PlatformKind.GITEE:
+            self.saved = None
+        else:
+            self.tokens.pop(platform, None)
         self.cleared = True
+
+    def load_last_platform(self):
+        return self.last_platform
+
+    def save_last_platform(self, platform):
+        self.last_platform = platform
 
 
 @pytest.fixture
@@ -79,7 +112,7 @@ def services(tmp_path):
     adapter = FakeAdapter()
     credentials = FakeCredentials()
     app = create_app(
-        client_factory=lambda token: adapter,
+        client_factories={PlatformKind.GITEE: lambda token: adapter},
         credential_store=credentials,
         report_directory=tmp_path,
     )
@@ -87,8 +120,11 @@ def services(tmp_path):
     return adapter, credentials, client
 
 
-def start_session(client, remember=False):
-    response = client.post("/api/session", json={"token": TOKEN, "remember": remember})
+def start_session(client, remember=False, platform=None):
+    payload = {"token": TOKEN, "remember": remember}
+    if platform is not None:
+        payload["platform"] = platform
+    response = client.post("/api/session", json=payload)
     assert response.status_code == 204
 
 
@@ -257,7 +293,7 @@ def test_saved_session_reports_active(tmp_path):
     credentials = FakeCredentials()
     credentials.saved = TOKEN
     app = create_app(
-        client_factory=lambda token: adapter,
+        client_factories={PlatformKind.GITEE: lambda token: adapter},
         credential_store=credentials,
         report_directory=tmp_path,
     )
@@ -266,7 +302,83 @@ def test_saved_session_reports_active(tmp_path):
     response = client.get("/api/session")
 
     assert response.status_code == 200
-    assert response.json() == {"active": True}
+    assert response.json() == {
+        "active": True,
+        "platform": "gitee",
+        "capabilities": {
+            "display_name": True,
+            "visibility": True,
+            "repository_topics": True,
+            "upload_mode": "single_commit",
+            "file_deletion": True,
+        },
+    }
+
+
+def test_last_platform_restores_only_its_own_saved_token(tmp_path):
+    adapter = FakeAdapter(capabilities=GITHUB_CAPABILITIES)
+    credentials = FakeCredentials()
+    credentials.tokens[PlatformKind.GITHUB] = TOKEN
+    credentials.last_platform = PlatformKind.GITHUB
+    app = create_app(
+        client_factories={PlatformKind.GITHUB: lambda token: adapter},
+        credential_store=credentials,
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+
+    session = client.get("/api/session").json()
+
+    assert session["active"] is True
+    assert session["platform"] == "github"
+
+
+def test_platform_switch_invalidates_old_work_and_enforces_capabilities(tmp_path):
+    gitee = FakeAdapter()
+    github = FakeAdapter(
+        capabilities=replace(GITHUB_CAPABILITIES, upload_mode="unsupported")
+    )
+    app = create_app(
+        client_factories={
+            PlatformKind.GITEE: lambda token: gitee,
+            PlatformKind.GITHUB: lambda token: github,
+        },
+        credential_store=FakeCredentials(),
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    start_session(client)
+    client.get("/api/repositories")
+    put_draft(client)
+    batch_id = client.post("/api/previews").json()["id"]
+    wait_for_state(client, batch_id, "ready")
+
+    start_session(client, platform="github")
+
+    assert client.post(f"/api/batches/{batch_id}/commit").status_code == 404
+    assert client.post("/api/previews").status_code == 400
+    assert gitee.updates == []
+    client.get("/api/repositories")
+    settings = client.post(
+        "/api/operations/settings",
+        json={
+            "selected": ["owner/repo-1"],
+            "names": {"owner/repo-1": " renamed "},
+            "visibility": "keep",
+        },
+    )
+    upload = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "files": [{"name": "a.txt", "content_base64": "eA=="}],
+            "message": "chore: upload",
+        },
+    )
+    assert settings.status_code == 400
+    assert upload.status_code == 400
+    assert github.settings_calls == []
+    assert github.upload_calls == []
 
 
 def wait_for_operation(client, operation_id):
@@ -286,7 +398,9 @@ def test_repository_list_includes_display_name_and_private(services):
     payload = client.get("/api/repositories").json()
 
     assert payload[0]["display_name"] == "Repo One"
+    assert payload[0]["platform"] == "gitee"
     assert payload[0]["private"] is True
+    assert payload[0]["description"] == "第一个仓库简介"
     assert payload[1]["display_name"] == "Repo Two"
     assert payload[1]["private"] is False
 
@@ -316,7 +430,7 @@ def test_settings_operation_skips_unchanged_items_and_maps_visibility(services):
         json={"selected": ["owner/repo-2"], "names": {}, "visibility": "private"},
     )
     wait_for_operation(client, response.json()["id"])
-    assert adapter.settings_calls[-1] == ("owner/repo-2", "Repo Two", True)
+    assert adapter.settings_calls[-1] == ("owner/repo-2", None, True)
 
 
 @pytest.mark.parametrize(
@@ -360,6 +474,7 @@ def test_labels_operation_trims_and_stably_deduplicates(services):
         ("owner/repo-1", ("Java", "Spring Boot")),
         ("owner/repo-2", ("Java", "Spring Boot")),
     ]
+    assert adapter.validated_topics == [("Java", "Spring Boot")]
     assert TOKEN not in str(operation)
 
 
@@ -570,3 +685,148 @@ def test_upload_rejects_total_size_over_twenty_five_mib(services):
 
     assert response.status_code == 413
     assert adapter.upload_calls == []
+
+
+def test_shutdown_marks_local_server_for_exit(services):
+    _, _, client = services
+    client.app.state.server = type("FakeServer", (), {"should_exit": False})()
+
+    response = client.post("/api/shutdown")
+
+    assert response.status_code == 202
+    assert client.app.state.server.should_exit is True
+
+
+@pytest.mark.parametrize("label", ["Uppercase", "has space", "中文", "-leading", "a" * 51])
+def test_github_invalid_topics_are_rejected_before_remote_work(tmp_path, label):
+    from readme_batch.platforms.github import GitHubClient
+
+    adapter = FakeAdapter(capabilities=GITHUB_CAPABILITIES)
+    adapter.validate_topics = lambda labels: GitHubClient.validate_topics(adapter, labels)
+    app = create_app(
+        client_factories={PlatformKind.GITHUB: lambda token: adapter},
+        credential_store=FakeCredentials(),
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    start_session(client, platform="github")
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/labels",
+        json={"selected": ["owner/repo-1"], "labels": [label]},
+    )
+
+    assert response.status_code == 400
+    assert adapter.label_calls == []
+
+
+def test_github_upload_capability_allows_existing_upload_api(tmp_path):
+    adapter = FakeAdapter(capabilities=GITHUB_CAPABILITIES)
+    app = create_app(
+        client_factories={PlatformKind.GITHUB: lambda token: adapter},
+        credential_store=FakeCredentials(),
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    start_session(client, platform="github")
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "files": [{"name": "a.txt", "content_base64": "eA=="}],
+            "message": "chore: upload",
+        },
+    )
+
+    assert response.status_code == 202
+    wait_for_operation(client, response.json()["id"])
+    assert len(adapter.upload_calls) == 1
+
+
+def test_gitcode_upload_is_rejected_before_remote_work(tmp_path):
+    from readme_batch.platforms.base import GITCODE_CAPABILITIES
+
+    adapter = FakeAdapter(capabilities=GITCODE_CAPABILITIES)
+    app = create_app(
+        client_factories={PlatformKind.GITCODE: lambda token: adapter},
+        credential_store=FakeCredentials(),
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    start_session(client, platform="gitcode")
+    client.get("/api/repositories")
+
+    response = client.post(
+        "/api/operations/uploads",
+        json={
+            "selected": ["owner/repo-1"],
+            "files": [{"name": "a.txt", "content_base64": "eA=="}],
+            "message": "chore: upload",
+        },
+    )
+
+    assert response.status_code == 400
+    assert adapter.upload_calls == []
+
+
+def test_legacy_gitee_token_restores_without_last_platform_preference(tmp_path):
+    adapter = FakeAdapter()
+    credentials = FakeCredentials()
+    credentials.saved = TOKEN
+    credentials.last_platform = None
+    app = create_app(
+        client_factories={PlatformKind.GITEE: lambda token: adapter},
+        credential_store=credentials,
+        report_directory=tmp_path,
+    )
+    client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+
+    session = client.get("/api/session").json()
+
+    assert session["active"] is True
+    assert session["platform"] == "gitee"
+    assert credentials.last_platform is PlatformKind.GITEE
+
+
+def test_in_flight_repository_list_cannot_publish_into_replacement_session(tmp_path):
+    import threading
+
+    class BlockingAdapter(FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def list_repositories(self):
+            self.entered.set()
+            self.release.wait(2)
+            return self.repos
+
+    old_adapter = BlockingAdapter()
+    new_adapter = FakeAdapter(capabilities=GITHUB_CAPABILITIES)
+    app = create_app(
+        client_factories={
+            PlatformKind.GITEE: lambda token: old_adapter,
+            PlatformKind.GITHUB: lambda token: new_adapter,
+        },
+        credential_store=FakeCredentials(),
+        report_directory=tmp_path,
+    )
+    old_client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    new_client = TestClient(app, headers={"X-README-Batch-Token": app.state.api_token})
+    start_session(old_client)
+    responses = []
+    thread = threading.Thread(target=lambda: responses.append(old_client.get("/api/repositories")))
+    thread.start()
+    assert old_adapter.entered.wait(2)
+
+    start_session(new_client, platform="github")
+    old_adapter.release.set()
+    thread.join(2)
+
+    assert responses[0].status_code == 409
+    assert app.state.editor.repositories == {}
+    assert app.state.editor.platform is PlatformKind.GITHUB

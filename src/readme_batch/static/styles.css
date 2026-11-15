@@ -48,6 +48,10 @@ h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(30px,
 .subtitle { margin: 12px 0 0; color: #c9d0cb; font-size: 14px; }
 .local-seal { display: flex; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid #53615a; font: 12px var(--mono); white-space: nowrap; }
 .local-seal span { width: 8px; height: 8px; background: #72d6a5; border-radius: 50%; box-shadow: 0 0 0 4px rgba(114, 214, 165, .12); }
+.header-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.exit-button { padding: 10px 14px; color: #f8f4e9; background: transparent; border: 1px solid #53615a; cursor: pointer; font-size: 12px; }
+.exit-button:hover { border-color: var(--accent); color: #ff8a65; }
+.exit-status { color: #c9d0cb; font-size: 12px; }
 
 .workspace { display: grid; grid-template-columns: minmax(280px, 340px) 1fr; gap: 22px; max-width: 1500px; margin: 0 auto; padding: 28px clamp(18px, 4vw, 48px) 46px; }
 .sidebar, .content { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
@@ -58,7 +62,8 @@ h1 { margin: 0; font-family: Georgia, "Songti SC", serif; font-size: clamp(30px,
 .section-heading span { color: var(--accent); font: 12px var(--mono); }
 h2 { margin: 0; font-size: 16px; letter-spacing: .04em; }
 label { display: block; margin: 15px 0 7px; color: var(--muted); font-size: 12px; font-weight: 600; }
-input, textarea, button { font: inherit; }
+input, textarea, button, select { font: inherit; }
+select { width: 100%; padding: 10px 12px; color: var(--ink); background: #fbfaf5; border: 1px solid #c9c6bb; border-radius: 0; }
 input[type="password"], input[type="text"], input[type="search"], textarea {
   width: 100%;
   color: var(--ink);
@@ -79,6 +84,8 @@ textarea { resize: vertical; min-height: 130px; font: 13px/1.65 var(--mono); }
 .button.dark { width: 100%; color: #fff; background: var(--ink); }
 .button.accent { color: #fff; background: var(--accent); box-shadow: 3px 3px 0 #9c371c; }
 .button.accent:hover:not(:disabled) { background: var(--accent-dark); }
+.button.danger { color: #fff; background: var(--red); box-shadow: 3px 3px 0 #7e2c28; }
+.button.danger:hover:not(:disabled) { background: #922f2b; }
 .button:disabled { cursor: not-allowed; opacity: .42; box-shadow: none; }
 .status, .hint, .empty, .summary { color: var(--muted); font-size: 12px; line-height: 1.6; }
 .status { min-height: 19px; margin: 12px 0 0; }
@@ -118,10 +125,12 @@ select { width: 100%; padding: 11px 12px; color: var(--ink); background: #fbfaf5
 select:focus { border-color: var(--accent); outline: none; box-shadow: 3px 3px 0 rgba(228, 87, 46, .13); }
 .settings-repositories { margin-top: 18px; border-top: 1px solid var(--line); }
 .setting-row { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 1fr) auto; gap: 14px; align-items: center; padding: 12px 0; border-bottom: 1px solid #e6e2d8; }
-.setting-path { overflow-wrap: anywhere; font: 12px/1.5 var(--mono); }
+.setting-identity { min-width: 0; }
+.setting-path { display: block; overflow-wrap: anywhere; font: 12px/1.5 var(--mono); }
+.setting-description { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
 .setting-name { margin: 0; }
 .setting-visibility { color: var(--muted); font-size: 11px; white-space: nowrap; }
-.settings-preview-button { width: auto; }
+.button.dark.settings-preview-button, .button.dark.deletion-preview-button { width: auto; flex-shrink: 0; }
 .change-items { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; }
 .change-item { padding: 10px 12px; color: var(--ink); background: #fbfaf5; border-left: 3px solid var(--accent); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
 .badge.running { color: #fff; background: var(--accent); }
@@ -130,6 +139,7 @@ input[type="file"] { width: 100%; padding: 12px; color: var(--ink); background: 
 .upload-file-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
 .upload-file-item { padding: 8px 10px; color: var(--muted); background: #fbfaf5; border-left: 3px solid var(--green); font: 12px/1.5 var(--mono); overflow-wrap: anywhere; }
 .reconciled { color: var(--green); font: 12px var(--mono); }
+.deletion-target { margin: 0; padding: 0 14px 12px; color: var(--muted); font: 11px/1.6 var(--mono); overflow-wrap: anywhere; }
 .operation-tabs { overflow-x: auto; }
 
 footer { padding: 18px clamp(24px, 5vw, 72px); color: #778078; border-top: 1px solid var(--line); font-size: 9px; }

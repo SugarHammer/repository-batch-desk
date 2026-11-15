@@ -68,6 +68,9 @@ class RepositoryExecutor:
                     with self._lock:
                         self._auth_failed = True
                 retryable = error.kind in {ErrorKind.TEMPORARY, ErrorKind.RATE_LIMIT}
+                if error.retry_after is not None and error.retry_after > 60:
+                    on_failure(repository, error, True)
+                    return
                 if retryable and attempt + 1 < self._max_attempts:
                     delay = error.retry_after if error.retry_after is not None else 0.25 * (2**attempt)
                     self._sleeper(delay)

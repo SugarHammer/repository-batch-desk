@@ -1,4 +1,11 @@
 from dataclasses import dataclass
+from enum import Enum
+
+
+class PlatformKind(str, Enum):
+    GITEE = "gitee"
+    GITHUB = "github"
+    GITCODE = "gitcode"
 
 
 @dataclass(frozen=True)
@@ -10,6 +17,8 @@ class Repository:
     html_url: str
     display_name: str = ""
     private: bool = False
+    platform: PlatformKind = PlatformKind.GITEE
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,13 @@ class CommitInfo:
 
 
 @dataclass(frozen=True)
+class RemoteFile:
+    path: str
+    branch: str
+    sha: str
+
+
+@dataclass(frozen=True)
 class UploadFile:
     path: str
     content: bytes
@@ -34,6 +50,12 @@ class UploadFile:
 
 @dataclass(frozen=True)
 class UploadResult:
+    commit_info: CommitInfo | None
+    reconciled: bool
+
+
+@dataclass(frozen=True)
+class DeleteResult:
     commit_info: CommitInfo | None
     reconciled: bool
 

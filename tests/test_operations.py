@@ -45,7 +45,7 @@ class FakeAdapter:
         if errors:
             raise errors.pop(0)
 
-    def add_project_labels(self, repo, labels):
+    def add_repository_topics(self, repo, labels):
         self.label_calls.append((repo.full_name, labels))
         if self.gate:
             self.gate.wait(2)
@@ -276,3 +276,14 @@ def test_retryable_upload_snapshots_have_bounded_retention():
     assert manager.get_operation(operation_ids[-1]).items[0].retryable is True
     with pytest.raises(StaleOperationError, match="cannot be retried"):
         manager.start_retry(operation_ids[0], "owner/repo-1")
+
+
+def test_invalidated_manager_rejects_new_operation_without_remote_work():
+    adapter = FakeAdapter()
+    manager = OperationManager(adapter, max_workers=1)
+    manager.invalidate()
+
+    with pytest.raises(StaleOperationError, match="stale"):
+        manager.start_labels([repository(1)], ["Java"])
+
+    assert adapter.label_calls == []

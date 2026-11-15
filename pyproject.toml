@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "readme-batch"
 version = "0.1.0"
-description = "Preview and commit literal README replacements across Gitee repositories"
+description = "Preview and commit batch changes across Gitee, GitHub, and GitCode repositories"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115,<1",

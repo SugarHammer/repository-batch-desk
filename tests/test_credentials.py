@@ -1,7 +1,7 @@
 import keyring
-import pytest
 
 from readme_batch.credentials import CredentialStore
+from readme_batch.models import PlatformKind
 
 
 class FakeKeyring:
@@ -24,35 +24,55 @@ class FakeKeyring:
         del self.values[(service, username)]
 
 
-@pytest.fixture
-def fake_keyring(monkeypatch):
+def test_credentials_are_isolated_by_platform(monkeypatch):
     fake = FakeKeyring()
     monkeypatch.setattr(keyring, "get_password", fake.get_password)
     monkeypatch.setattr(keyring, "set_password", fake.set_password)
     monkeypatch.setattr(keyring, "delete_password", fake.delete_password)
-    return fake
-
-
-def test_save_load_and_clear_use_one_fixed_service(fake_keyring):
     store = CredentialStore()
 
-    store.save("secret-token")
+    store.save(PlatformKind.GITEE, "gitee-token")
+    store.save(PlatformKind.GITHUB, "github-token")
+    store.save(PlatformKind.GITCODE, "gitcode-token")
 
-    assert store.load() == "secret-token"
-    store.clear()
-    assert store.load() is None
-    assert {call[1:] for call in fake_keyring.calls} == {("readme-batch/gitee", "gitee")}
+    assert store.load(PlatformKind.GITEE) == "gitee-token"
+    assert store.load(PlatformKind.GITHUB) == "github-token"
+    assert store.load(PlatformKind.GITCODE) == "gitcode-token"
+    store.clear(PlatformKind.GITHUB)
+    assert store.load(PlatformKind.GITHUB) is None
+    assert store.load(PlatformKind.GITEE) == "gitee-token"
+    assert store.load(PlatformKind.GITCODE) == "gitcode-token"
+    assert ("save", "readme-batch/github", "github") in fake.calls
 
 
-def test_clear_tolerates_missing_credential(fake_keyring):
-    CredentialStore().clear()
+def test_last_platform_is_restored_and_invalid_preference_is_ignored(monkeypatch):
+    fake = FakeKeyring()
+    monkeypatch.setattr(keyring, "get_password", fake.get_password)
+    monkeypatch.setattr(keyring, "set_password", fake.set_password)
+    monkeypatch.setattr(keyring, "delete_password", fake.delete_password)
+    store = CredentialStore()
 
-    assert fake_keyring.calls == [("clear", "readme-batch/gitee", "gitee")]
+    assert store.load_last_platform() is None
+    store.save_last_platform(PlatformKind.GITCODE)
+    assert store.load_last_platform() is PlatformKind.GITCODE
+    fake.values[("readme-batch/preferences", "last-platform")] = "unknown"
+    assert store.load_last_platform() is None
 
 
-def test_credentials_never_write_project_files(fake_keyring, tmp_path, monkeypatch):
+def test_clear_tolerates_missing_credential(monkeypatch):
+    fake = FakeKeyring()
+    monkeypatch.setattr(keyring, "delete_password", fake.delete_password)
+    CredentialStore().clear(PlatformKind.GITEE)
+    assert fake.calls == [("clear", "readme-batch/gitee", "gitee")]
+
+
+def test_credentials_never_write_project_files(monkeypatch, tmp_path):
+    fake = FakeKeyring()
+    monkeypatch.setattr(keyring, "get_password", fake.get_password)
+    monkeypatch.setattr(keyring, "set_password", fake.set_password)
+    monkeypatch.setattr(keyring, "delete_password", fake.delete_password)
     monkeypatch.chdir(tmp_path)
 
-    CredentialStore().save("secret-token")
+    CredentialStore().save(PlatformKind.GITHUB, "secret-token")
 
     assert list(tmp_path.iterdir()) == []
